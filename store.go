@@ -1,23 +1,27 @@
-// The forge's shared in-memory store.
+// Shared in-memory store for the forge.
 //
-// This file is the contract every surface module (REST, git smart HTTP,
-// GraphQL, MCP) builds on. All four surfaces share ONE Store per process,
-// so a repo, issue, or pull request created through any surface is visible
-// through all the others with stable ids.
+// One Store serves every surface (REST, git smart HTTP, GraphQL, MCP), so
+// an object created through any of them is visible through all the others
+// with stable ids. Every Store method locks internally; callers never touch
+// Repo maps except while holding the store lock, and never mutate them
+// except through Store methods. Reads of immutable identity fields (ID,
+// Owner, Name) on a *Repo from a getter are safe without the lock.
 //
-// Locking discipline: every Store method locks internally (RWMutex). Callers
-// must NOT touch Repo fields or the maps inside a Repo directly except while
-// holding s.RLock()/s.Lock(), and must never mutate them except through Store
-// methods. Reads of immutable identity fields (ID, Owner, Name) on a *Repo
-// returned by a getter are safe without the lock; everything else goes
-// through the accessors or under RLock.
-//
-// Determinism: nothing stored or emitted may depend on the wall clock or on
+// Determinism: nothing stored or emitted depends on the wall clock or on
 // unseeded randomness. Timestamps come from Clock (seeded from
-// MAKEFUN_TRIAL_NOW / MAKEFUN_TRIAL_SEED when present, else fixed constants)
-// plus the global creation sequence; request ids come from a monotonic
-// counter. Orderings are deterministic: repos/issues/labels in creation
-// (sequence) order, refs sorted by name, PR files sorted by path.
+// MAKEFUN_TRIAL_NOW / MAKEFUN_TRIAL_SEED when present, else fixed
+// constants) plus the global creation sequence; request ids come from a
+// monotonic counter. Orderings are deterministic: repos/issues/labels in
+// creation order, refs sorted by name, PR files sorted by path.
+//
+// Performance shape (v2): Timestamp results are memoized in the Clock
+// (the value is a pure function of the sequence number); ObjectSHA builds
+// its "<type> <len>\0" header with direct byte writes and hashes once;
+// PutObjectsBatch stores a whole unpacked pack under a single write lock
+// using SHAs the caller already computed; each Repo carries a generation
+// counter plus a cached immutable snapshot, so the git layer can reuse one
+// consistent refs+objects view across many requests and only rebuilds it
+// when a push or contents write actually changes the repo.
 
 package main
 
@@ -27,7 +31,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -37,7 +40,7 @@ import (
 	"time"
 )
 
-// Fixed scenario constants (suite constants, identical in every trial).
+// Scenario constants, identical in every trial.
 const (
 	// ViewerLogin is the login of the token owner.
 	ViewerLogin = "adaiversen"
@@ -63,9 +66,13 @@ const DefaultSeed uint64 = 0x6a09e667f3bcc909
 var DefaultNow = time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 // Clock is the store's logical clock. It never reads the wall clock.
+// Timestamp is a pure function of the sequence number, so results are
+// memoized: the same seq always renders the same string.
 type Clock struct {
 	base time.Time
 	seed uint64
+	mu   sync.RWMutex
+	memo map[uint64]string
 }
 
 // NewClock builds a Clock from MAKEFUN_TRIAL_NOW / MAKEFUN_TRIAL_SEED when
@@ -95,9 +102,28 @@ func (c *Clock) Base() time.Time { return c.base }
 func (c *Clock) Seed() uint64 { return c.seed }
 
 // Timestamp renders a deterministic RFC3339 timestamp for a creation
-// sequence number: epoch + seq seconds.
+// sequence number: epoch + seq seconds. The result is memoized; the clock
+// never advances, so a seq maps to exactly one string for the trial.
+// The memo is read under a shared lock and formatted outside it, so the
+// read workload's per-request timestamp lookups never serialize.
 func (c *Clock) Timestamp(seq uint64) string {
-	return c.base.Add(time.Duration(seq) * time.Second).UTC().Format(time.RFC3339)
+	c.mu.RLock()
+	if rendered, ok := c.memo[seq]; ok {
+		c.mu.RUnlock()
+		return rendered
+	}
+	c.mu.RUnlock()
+	rendered := c.base.Add(time.Duration(seq) * time.Second).UTC().Format(time.RFC3339)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.memo == nil {
+		c.memo = make(map[uint64]string)
+	}
+	if prev, ok := c.memo[seq]; ok {
+		return prev
+	}
+	c.memo[seq] = rendered
+	return rendered
 }
 
 // ObjectType is a git object type.
@@ -140,12 +166,25 @@ func ParseObjectType(s string) (ObjectType, bool) {
 	return 0, false
 }
 
-// ObjectSHA computes the git SHA-1 id of an object: SHA-1("<type> <len>\0" + raw).
+// ObjectSHA computes the git SHA-1 id of an object: SHA-1("<type> <len>\0" +
+// raw). The header is assembled with direct byte writes into a stack
+// buffer — no fmt, no allocation — and the object is hashed in a single
+// pass: the header bytes, then the raw payload.
 func ObjectSHA(typ ObjectType, raw []byte) string {
+	var head [40]byte
+	n := copy(head[:], typ.String())
+	head[n] = ' '
+	n++
+	digits := strconv.AppendInt(head[n:n], int64(len(raw)), 10)
+	n += len(digits)
+	head[n] = 0
+	n++
 	h := sha1.New()
-	fmt.Fprintf(h, "%s %d\x00", typ.String(), len(raw))
+	h.Write(head[:n])
 	h.Write(raw)
-	return hex.EncodeToString(h.Sum(nil))
+	var out [40]byte
+	hex.Encode(out[:], h.Sum(nil))
+	return string(out[:])
 }
 
 // TreeEntry is one entry of a parsed git tree object.
@@ -185,44 +224,55 @@ type GitObject struct {
 	Tag    *ParsedTag    // set when Type == ObjTag
 }
 
+// parseTree decodes the binary tree format: "<mode> <name>\0<20-byte sha>"
+// repeated. A malformed tail stops the scan; the entries decoded so far
+// are kept.
 func parseTree(raw []byte) []TreeEntry {
 	var entries []TreeEntry
-	rest := raw
-	for len(rest) > 0 {
-		sp := bytes.IndexByte(rest, ' ')
+	pos := 0
+	for pos < len(raw) {
+		sp := bytes.IndexByte(raw[pos:], ' ')
 		if sp < 0 {
 			break
 		}
-		nul := bytes.IndexByte(rest[sp+1:], 0)
-		if nul < 0 {
-			break
-		}
-		nul += sp + 1
-		if nul+21 > len(rest) {
+		mode := raw[pos : pos+sp]
+		rest := raw[pos+sp+1:]
+		nul := bytes.IndexByte(rest, 0)
+		if nul < 0 || nul+21 > len(rest) {
 			break
 		}
 		entries = append(entries, TreeEntry{
-			Mode: string(rest[:sp]),
-			Name: string(rest[sp+1 : nul]),
+			Mode: string(mode),
+			Name: string(rest[:nul]),
 			SHA:  hex.EncodeToString(rest[nul+1 : nul+21]),
 		})
-		rest = rest[nul+21:]
+		pos += sp + 1 + nul + 21
 	}
 	return entries
 }
 
-func parseCommit(raw []byte) *ParsedCommit {
-	pc := &ParsedCommit{}
+// forEachHeaderLine splits a commit/tag payload at the blank line and calls
+// fn for each "key value" header line, skipping blanks and continuation
+// lines. It returns the message body (everything after the blank line).
+func forEachHeaderLine(raw []byte, fn func(key, val string)) string {
 	head, body, _ := strings.Cut(string(raw), "\n\n")
-	pc.Message = body
 	for _, line := range strings.Split(head, "\n") {
 		if line == "" || line[0] == ' ' {
-			continue // blank or continuation line
+			continue
 		}
 		key, val, ok := strings.Cut(line, " ")
 		if !ok {
 			continue
 		}
+		fn(key, val)
+	}
+	return body
+}
+
+// parseCommit decodes a commit object's headers and message.
+func parseCommit(raw []byte) *ParsedCommit {
+	pc := &ParsedCommit{}
+	pc.Message = forEachHeaderLine(raw, func(key, val string) {
 		switch key {
 		case "tree":
 			pc.Tree = val
@@ -233,22 +283,14 @@ func parseCommit(raw []byte) *ParsedCommit {
 		case "committer":
 			pc.Committer = val
 		}
-	}
+	})
 	return pc
 }
 
+// parseTag decodes an annotated tag object's headers and message.
 func parseTag(raw []byte) *ParsedTag {
 	pt := &ParsedTag{}
-	head, body, _ := strings.Cut(string(raw), "\n\n")
-	pt.Message = body
-	for _, line := range strings.Split(head, "\n") {
-		if line == "" || line[0] == ' ' {
-			continue
-		}
-		key, val, ok := strings.Cut(line, " ")
-		if !ok {
-			continue
-		}
+	pt.Message = forEachHeaderLine(raw, func(key, val string) {
 		switch key {
 		case "object":
 			pt.Object = val
@@ -259,11 +301,14 @@ func parseTag(raw []byte) *ParsedTag {
 		case "tagger":
 			pt.Tagger = val
 		}
-	}
+	})
 	return pt
 }
 
 // Repo is one repository: identity, git objects, refs, issues, PRs, labels.
+// gen counts git mutations (object or ref changes) and snap is the cached
+// immutable snapshot for that generation; both are guarded by the Store
+// lock and are never read or written outside Store methods.
 type Repo struct {
 	ID            int64
 	Owner         string
@@ -286,6 +331,22 @@ type Repo struct {
 
 	Labels     map[string]*Label
 	LabelOrder []string
+
+	gen  uint64
+	snap *RepoSnapshot
+}
+
+// RepoSnapshot is a consistent, immutable view of a repo's git state at one
+// generation: refs (plus their sorted names) and the object map, both
+// copied once when the snapshot was built. GitObjects are immutable once
+// stored, so sharing their pointers is safe; the maps themselves are never
+// mutated after the snapshot is built. The git layer reuses this handle
+// across requests instead of copying the object map on every call.
+type RepoSnapshot struct {
+	Generation uint64
+	Refs       map[string]string
+	RefNames   []string // sorted
+	Objects    map[string]*GitObject
 }
 
 // Label is a repo label. An issue may only carry labels that exist.
@@ -429,6 +490,57 @@ func BranchRef(name string) string { return "refs/heads/" + name }
 // TagRef returns the full ref name for a tag.
 func TagRef(name string) string { return "refs/tags/" + name }
 
+// noteGitChangedLocked records a git mutation: the generation advances and
+// the cached snapshot is dropped, so the next Snapshot rebuilds. Callers
+// hold the write lock and call this only when objects or refs actually
+// changed.
+func (s *Store) noteGitChangedLocked(r *Repo) {
+	r.gen++
+	r.snap = nil
+}
+
+// Generation returns the repo's current git generation: it advances on
+// every object or ref mutation and never moves otherwise. The pack cache
+// keys on it, so a pack built at one generation is never reused after
+// the repo changes.
+func (s *Store) Generation(r *Repo) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return r.gen
+}
+
+// Snapshot returns the repo's cached immutable snapshot, building it on
+// first use after a git mutation. Repeated calls at the same generation
+// return the same pointer with no map copying. The snapshot's maps must
+// never be mutated by callers.
+func (s *Store) Snapshot(r *Repo) *RepoSnapshot {
+	s.mu.RLock()
+	if snap := r.snap; snap != nil {
+		s.mu.RUnlock()
+		return snap
+	}
+	s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.snap != nil {
+		return r.snap
+	}
+	refs := make(map[string]string, len(r.Refs))
+	names := make([]string, 0, len(r.Refs))
+	for name, sha := range r.Refs {
+		refs[name] = sha
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	objs := make(map[string]*GitObject, len(r.Objects))
+	for sha, obj := range r.Objects {
+		objs[sha] = obj
+	}
+	snap := &RepoSnapshot{Generation: r.gen, Refs: refs, RefNames: names, Objects: objs}
+	r.snap = snap
+	return snap
+}
+
 // CreateRepo creates a repo with the next repo id and default branch "main".
 // It returns ErrRepoExists when owner/name already exists.
 func (s *Store) CreateRepo(owner, name, description string, private bool) (*Repo, error) {
@@ -516,6 +628,21 @@ func (s *Store) SetRepoDescription(r *Repo, description string) {
 	r.Description = description
 }
 
+// buildGitObject parses one object payload into its stored form. sha must
+// already be the object's id (computed by the caller or by ObjectSHA).
+func buildGitObject(sha string, typ ObjectType, raw []byte) *GitObject {
+	obj := &GitObject{SHA: sha, Type: typ, Raw: raw}
+	switch typ {
+	case ObjTree:
+		obj.Tree = parseTree(raw)
+	case ObjCommit:
+		obj.Commit = parseCommit(raw)
+	case ObjTag:
+		obj.Tag = parseTag(raw)
+	}
+	return obj
+}
+
 // PutObject stores an object, computing its SHA-1 id. Storing an object that
 // already exists is a no-op returning the stored object.
 func (s *Store) PutObject(r *Repo, typ ObjectType, raw []byte) *GitObject {
@@ -529,17 +656,48 @@ func (s *Store) putObjectLocked(r *Repo, typ ObjectType, raw []byte) *GitObject 
 	if existing, ok := r.Objects[sha]; ok {
 		return existing
 	}
-	obj := &GitObject{SHA: sha, Type: typ, Raw: raw}
-	switch typ {
-	case ObjTree:
-		obj.Tree = parseTree(raw)
-	case ObjCommit:
-		obj.Commit = parseCommit(raw)
-	case ObjTag:
-		obj.Tag = parseTag(raw)
-	}
+	obj := buildGitObject(sha, typ, raw)
 	r.Objects[sha] = obj
+	s.noteGitChangedLocked(r)
 	return obj
+}
+
+// PutObjectsBatch stores a whole unpacked pack under one write lock. The
+// caller supplies each object's SHA, already computed once while parsing
+// the pack (see ParsePack), so no object is hashed a second time here; an
+// empty SHA falls back to computing it. Objects already in the store are
+// returned as-is. The returned slice lines up with the input: out[i] is
+// the stored object for objs[i] (nil for a nil input entry). The repo
+// generation advances once, and only when at least one object was new.
+func (s *Store) PutObjectsBatch(r *Repo, objs []*PackObject) []*GitObject {
+	if len(objs) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*GitObject, len(objs))
+	changed := false
+	for i, po := range objs {
+		if po == nil {
+			continue
+		}
+		sha := po.SHA
+		if sha == "" {
+			sha = ObjectSHA(po.Type, po.Raw)
+		}
+		if existing, ok := r.Objects[sha]; ok {
+			out[i] = existing
+			continue
+		}
+		obj := buildGitObject(sha, po.Type, po.Raw)
+		r.Objects[sha] = obj
+		out[i] = obj
+		changed = true
+	}
+	if changed {
+		s.noteGitChangedLocked(r)
+	}
+	return out
 }
 
 // GetObject returns the object with the given SHA-1 hex, if stored.
@@ -558,15 +716,15 @@ func (s *Store) GetRef(r *Repo, ref string) (string, bool) {
 	return sha, ok
 }
 
-// ListRefs returns all refs sorted by name.
+// ListRefs returns all refs sorted by name. The order comes from the
+// repo's cached snapshot, so repeated listings at one generation do not
+// re-sort; the snapshot is taken with no lock held here.
 func (s *Store) ListRefs(r *Repo) []RefEntry {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]RefEntry, 0, len(r.Refs))
-	for name, sha := range r.Refs {
-		out = append(out, RefEntry{Name: name, SHA: sha})
+	snap := s.Snapshot(r)
+	out := make([]RefEntry, 0, len(snap.RefNames))
+	for _, name := range snap.RefNames {
+		out = append(out, RefEntry{Name: name, SHA: snap.Refs[name]})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -575,6 +733,7 @@ func (s *Store) SetRef(r *Repo, ref, sha string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r.Refs[ref] = sha
+	s.noteGitChangedLocked(r)
 }
 
 // DeleteRef removes a ref. It reports whether one existed.
@@ -585,6 +744,7 @@ func (s *Store) DeleteRef(r *Repo, ref string) bool {
 		return false
 	}
 	delete(r.Refs, ref)
+	s.noteGitChangedLocked(r)
 	return true
 }
 
@@ -606,6 +766,7 @@ func (s *Store) UpdateRefChecked(r *Repo, ref, oldSHA, newSHA string) error {
 			return ErrStaleOld
 		}
 		delete(r.Refs, ref)
+		s.noteGitChangedLocked(r)
 		return nil
 	}
 	if !exists {
@@ -613,6 +774,7 @@ func (s *Store) UpdateRefChecked(r *Repo, ref, oldSHA, newSHA string) error {
 			return ErrStaleOld
 		}
 		r.Refs[ref] = newSHA
+		s.noteGitChangedLocked(r)
 		return nil
 	}
 	if oldSHA != current {
@@ -622,6 +784,7 @@ func (s *Store) UpdateRefChecked(r *Repo, ref, oldSHA, newSHA string) error {
 		return ErrNonFastForward
 	}
 	r.Refs[ref] = newSHA
+	s.noteGitChangedLocked(r)
 	return nil
 }
 
@@ -633,6 +796,9 @@ func (s *Store) IsAncestor(r *Repo, ancestor, descendant string) bool {
 	return s.isAncestorLocked(r, ancestor, descendant)
 }
 
+// isAncestorLocked is the lock-held ancestor walk: breadth-first from the
+// peeled descendant, parents in stored order, with a visited set. The
+// common bench case (parent == old tip) answers at the first level.
 func (s *Store) isAncestorLocked(r *Repo, ancestor, descendant string) bool {
 	if ancestor == descendant {
 		return true
@@ -643,10 +809,8 @@ func (s *Store) isAncestorLocked(r *Repo, ancestor, descendant string) bool {
 	}
 	seen := map[string]bool{start: true}
 	queue := []string{start}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		obj := r.Objects[cur]
+	for head := 0; head < len(queue); head++ {
+		obj := r.Objects[queue[head]]
 		if obj == nil || obj.Commit == nil {
 			continue
 		}
@@ -698,34 +862,44 @@ func (s *Store) commitTreeLocked(r *Repo, commitSHA string) (string, bool) {
 	return obj.Commit.Tree, true
 }
 
-// FlattenTree returns path -> blob SHA-1 for every blob reachable from a
-// tree, recursing into subtrees. Missing trees yield an empty map.
-func (s *Store) FlattenTree(r *Repo, treeSHA string) map[string]string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make(map[string]string)
-	s.flattenLocked(r, treeSHA, "", out, make(map[string]bool), 0)
-	return out
+// treeFlattener walks one tree recursively, collecting path -> blob SHA-1
+// for every blob, skipping cycles via the per-path ancestor set and
+// stopping past depth 64.
+type treeFlattener struct {
+	r    *Repo
+	out  map[string]string
+	seen map[string]bool
 }
 
-func (s *Store) flattenLocked(r *Repo, treeSHA, prefix string, out map[string]string, ancestors map[string]bool, depth int) {
-	if depth > 64 || ancestors[treeSHA] {
+func (w *treeFlattener) walk(treeSHA, prefix string, depth int) {
+	if depth > 64 || w.seen[treeSHA] {
 		return
 	}
-	ancestors[treeSHA] = true
-	defer delete(ancestors, treeSHA)
-	obj := r.Objects[treeSHA]
+	w.seen[treeSHA] = true
+	defer delete(w.seen, treeSHA)
+	obj := w.r.Objects[treeSHA]
 	if obj == nil || obj.Type != ObjTree {
 		return
 	}
 	for _, e := range obj.Tree {
 		p := prefix + e.Name
 		if e.Mode == "40000" {
-			s.flattenLocked(r, e.SHA, p+"/", out, ancestors, depth+1)
+			w.walk(e.SHA, p+"/", depth+1)
 		} else {
-			out[p] = e.SHA
+			w.out[p] = e.SHA
 		}
 	}
+}
+
+// FlattenTree returns path -> blob SHA-1 for every blob reachable from a
+// tree, recursing into subtrees. Missing trees yield an empty map.
+func (s *Store) FlattenTree(r *Repo, treeSHA string) map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]string)
+	w := &treeFlattener{r: r, out: out, seen: make(map[string]bool)}
+	w.walk(treeSHA, "", 0)
+	return out
 }
 
 // MergeBase returns the nearest common ancestor of two commits (tags peeled),
@@ -738,25 +912,22 @@ func (s *Store) MergeBase(r *Repo, a, b string) string {
 	b = s.peelLocked(r, b)
 	distA := map[string]int{a: 0}
 	queue := []string{a}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		obj := r.Objects[cur]
+	for head := 0; head < len(queue); head++ {
+		obj := r.Objects[queue[head]]
 		if obj == nil || obj.Commit == nil {
 			continue
 		}
 		for _, p := range obj.Commit.Parents {
 			if _, ok := distA[p]; !ok {
-				distA[p] = distA[cur] + 1
+				distA[p] = distA[queue[head]] + 1
 				queue = append(queue, p)
 			}
 		}
 	}
 	seen := map[string]bool{b: true}
 	queue = []string{b}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
+	for head := 0; head < len(queue); head++ {
+		cur := queue[head]
 		if _, ok := distA[cur]; ok {
 			return cur
 		}
@@ -789,11 +960,13 @@ func (s *Store) DiffFiles(r *Repo, baseCommitSHA, headCommitSHA string) []PRFile
 func (s *Store) diffFilesLocked(r *Repo, baseCommitSHA, headCommitSHA string) []PRFile {
 	base := make(map[string]string)
 	if tree, ok := s.commitTreeLocked(r, baseCommitSHA); ok {
-		s.flattenLocked(r, tree, "", base, make(map[string]bool), 0)
+		w := &treeFlattener{r: r, out: base, seen: make(map[string]bool)}
+		w.walk(tree, "", 0)
 	}
 	head := make(map[string]string)
 	if tree, ok := s.commitTreeLocked(r, headCommitSHA); ok {
-		s.flattenLocked(r, tree, "", head, make(map[string]bool), 0)
+		w := &treeFlattener{r: r, out: head, seen: make(map[string]bool)}
+		w.walk(tree, "", 0)
 	}
 	return diffFileMaps(r, base, head)
 }
@@ -838,6 +1011,8 @@ func blobBytes(r *Repo, sha string) []byte {
 	return nil
 }
 
+// countLines counts newline-terminated lines, plus a final unterminated
+// line when the blob does not end in "\n".
 func countLines(b []byte) int {
 	if len(b) == 0 {
 		return 0
@@ -1035,8 +1210,14 @@ func (s *Store) MarkPRMerged(r *Repo, number int, mergeSHA string) (*PullRequest
 // base64url("forge:<kind>:<repoID>:<number>"); it never equals a plain
 // databaseId or issue/PR number string.
 func GlobalID(kind string, repoID int64, number int) string {
-	raw := fmt.Sprintf("forge:%s:%d:%d", kind, repoID, number)
-	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+	var raw []byte
+	raw = append(raw, "forge:"...)
+	raw = append(raw, kind...)
+	raw = append(raw, ':')
+	raw = strconv.AppendInt(raw, repoID, 10)
+	raw = append(raw, ':')
+	raw = strconv.AppendInt(raw, int64(number), 10)
+	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
 // ParseGlobalID decodes a GlobalID. Kinds are "Repository", "Issue", and

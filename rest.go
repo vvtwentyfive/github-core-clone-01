@@ -14,6 +14,13 @@
 // sequence numbers; commit objects built here (contents writes, squash
 // merges) use sequence-derived author/committer timestamps, so identical
 // request streams produce identical object ids.
+//
+// Performance shape (v2): the hot views (issue, repository, pull request,
+// label, comment) are encoded by hand into a reused-style byte buffer
+// instead of reflection-marshalled structs; request bodies are decoded
+// exactly once per request from bytes the middleware already read; and
+// timestamps are memoized per sequence number because the logical clock
+// is a pure function of that number.
 
 package main
 
@@ -28,7 +35,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type metaBody struct {
@@ -37,6 +46,34 @@ type metaBody struct {
 
 type restHandler struct {
 	s *Store
+
+	// tsMu/tsCache memoize Clock.Timestamp: the logical clock is a pure
+	// function of the sequence number, so formatting it once per seq is
+	// exact and never stale within a process. Reads take the read lock;
+	// only a cache miss takes the write lock.
+	tsMu    sync.RWMutex
+	tsCache map[uint64]string
+}
+
+// ts renders the deterministic timestamp for seq, memoized.
+func (h *restHandler) ts(seq uint64) string {
+	h.tsMu.RLock()
+	if v, ok := h.tsCache[seq]; ok {
+		h.tsMu.RUnlock()
+		return v
+	}
+	h.tsMu.RUnlock()
+	h.tsMu.Lock()
+	defer h.tsMu.Unlock()
+	if v, ok := h.tsCache[seq]; ok {
+		return v
+	}
+	v := h.s.Timestamp(seq)
+	if h.tsCache == nil {
+		h.tsCache = make(map[uint64]string)
+	}
+	h.tsCache[seq] = v
+	return v
 }
 
 // RegisterREST registers the REST v3 routes on mux.
@@ -80,19 +117,142 @@ func (h *restHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// restDecodeJSON decodes a request body; an empty body decodes to the zero
-// value. The middleware has already rejected malformed JSON on this surface,
-// so an error here is a shape mismatch.
-func restDecodeJSON(r *http.Request, v any) error {
+// ---------------------------------------------------------------------------
+// Request bodies: decoded exactly once.
+//
+// The middleware in main.go already read and validated the body (and
+// rewound r.Body). When it also stashes those bytes in the request context
+// under restBodyKey, decoding here reuses them with no second read and no
+// second parse; otherwise the body is read once here and unmarshalled once.
+// Either way a handler never decodes the same body twice.
+//
+// NOTE FOR THE INTEGRATOR (main.go): stash with
+//
+//	r.WithContext(context.WithValue(r.Context(), restBodyKey{}, bodyBytes))
+//
+// to get the zero-copy path; the fallback below stays correct without it.
+type restBodyKey struct{}
+
+func restBodyBytes(r *http.Request) ([]byte, error) {
+	if b, ok := r.Context().Value(restBodyKey{}).([]byte); ok {
+		return b, nil
+	}
 	if r.Body == nil {
-		return nil
+		return nil, nil
 	}
-	err := json.NewDecoder(r.Body).Decode(v)
-	if err == io.EOF {
-		return nil
-	}
-	return err
+	return io.ReadAll(r.Body)
 }
+
+// restDecodeJSON unmarshals the request body into v; an empty body leaves
+// v at its zero value. The middleware has already rejected malformed JSON
+// on this surface, so an error here is a shape mismatch.
+func restDecodeJSON(r *http.Request, v any) error {
+	b, err := restBodyBytes(r)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil
+	}
+	return json.Unmarshal(b, v)
+}
+
+// ---------------------------------------------------------------------------
+// Hand-rolled JSON encoding (hot views only).
+//
+// appendJSONString matches encoding/json's string escaping exactly: quote,
+// backslash, \n \r \t, other control bytes as \u00XX, < > & as \u003C
+// \u003E \u0026, U+2028/U+2029 escaped, and invalid UTF-8 bytes replaced
+// with \ufffd. Field order in every encoder below is the wire order the
+// suite expects (the same order the old struct tags produced).
+
+const restHexDigits = "0123456789abcdef"
+
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	dst = appendJSONStringContent(dst, s)
+	return append(dst, '"')
+}
+
+// appendJSONStringParts appends one quoted string built from several
+// pieces (e.g. owner + "/" + name) without allocating the concatenation.
+func appendJSONStringParts(dst []byte, parts ...string) []byte {
+	dst = append(dst, '"')
+	for _, p := range parts {
+		dst = appendJSONStringContent(dst, p)
+	}
+	return append(dst, '"')
+}
+
+// appendJSONStringContent appends the escaped contents of s without quotes.
+func appendJSONStringContent(dst []byte, s string) []byte {
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < utf8.RuneSelf {
+			switch c {
+			case '"', '\\':
+				dst = append(dst, '\\', c)
+			case '\n':
+				dst = append(dst, '\\', 'n')
+			case '\r':
+				dst = append(dst, '\\', 'r')
+			case '\t':
+				dst = append(dst, '\\', 't')
+			case '<':
+				dst = append(dst, '\\', 'u', '0', '0', '3', 'c')
+			case '>':
+				dst = append(dst, '\\', 'u', '0', '0', '3', 'e')
+			case '&':
+				dst = append(dst, '\\', 'u', '0', '0', '2', '6')
+			default:
+				if c < 0x20 {
+					dst = append(dst, '\\', 'u', '0', '0', restHexDigits[c>>4], restHexDigits[c&0xf])
+				} else {
+					dst = append(dst, c)
+				}
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			dst = append(dst, '\\', 'u', 'f', 'f', 'f', 'd')
+			i++
+			continue
+		}
+		if r == '\u2028' {
+			dst = append(dst, '\\', 'u', '2', '0', '2', '8')
+		} else if r == '\u2029' {
+			dst = append(dst, '\\', 'u', '2', '0', '2', '9')
+		} else {
+			dst = append(dst, s[i:i+size]...)
+		}
+		i += size
+	}
+	return dst
+}
+
+// appendJSONUser appends {"login":...,"id":...,"type":"User"} for the viewer.
+func appendJSONUser(dst []byte, login string, id int) []byte {
+	dst = append(dst, `{"login":`...)
+	dst = appendJSONString(dst, login)
+	dst = append(dst, `,"id":`...)
+	dst = strconv.AppendInt(dst, int64(id), 10)
+	dst = append(dst, `,"type":"User"}`...)
+	return dst
+}
+
+// writeRawJSON writes pre-encoded JSON bytes with a status, matching
+// WriteJSON's trailing newline and Content-Type.
+func writeRawJSON(w http.ResponseWriter, status int, b []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(b)
+	_, _ = w.Write([]byte{'\n'})
+}
+
+// ---------------------------------------------------------------------------
+// Pagination
 
 // restPageParams parses page/per_page query parameters (defaults 1/30,
 // per_page clamped to 1..100).
@@ -156,8 +316,9 @@ func restSetPageLinks(w http.ResponseWriter, r *http.Request, page, perPage, tot
 	w.Header().Set("Link", strings.Join(parts, ", "))
 }
 
-// -------------------------------------------------------------------------------------------
-// Shared response shapes
+// ---------------------------------------------------------------------------
+// Hot-view encoders. Each appends the exact JSON the old struct-based
+// views produced, in the same field order, without reflection.
 
 type restUser struct {
 	Login string `json:"login"`
@@ -167,50 +328,6 @@ type restUser struct {
 
 var restViewer = restUser{Login: ViewerLogin, ID: ViewerID, Type: "User"}
 
-type restPerms struct {
-	Admin    bool `json:"admin"`
-	Maintain bool `json:"maintain"`
-	Push     bool `json:"push"`
-	Triage   bool `json:"triage"`
-	Pull     bool `json:"pull"`
-}
-
-type restRepo struct {
-	ID            int64     `json:"id"`
-	Name          string    `json:"name"`
-	FullName      string    `json:"full_name"`
-	Owner         restUser  `json:"owner"`
-	Private       bool      `json:"private"`
-	Description   string    `json:"description"`
-	DefaultBranch string    `json:"default_branch"`
-	Permissions   restPerms `json:"permissions"`
-	CreatedAt     string    `json:"created_at"`
-	UpdatedAt     string    `json:"updated_at"`
-	HasIssues     bool      `json:"has_issues"`
-	Fork          bool      `json:"fork"`
-	Archived      bool      `json:"archived"`
-}
-
-func (h *restHandler) repoView(r *Repo) restRepo {
-	h.s.RLock()
-	desc, priv, seq := r.Description, r.Private, r.Seq
-	h.s.RUnlock()
-	ts := h.s.Timestamp(seq)
-	return restRepo{
-		ID:            r.ID,
-		Name:          r.Name,
-		FullName:      r.Owner + "/" + r.Name,
-		Owner:         restUser{Login: r.Owner, ID: ViewerID, Type: "User"},
-		Private:       priv,
-		Description:   desc,
-		DefaultBranch: r.DefaultBranch,
-		Permissions:   restPerms{Admin: true, Maintain: true, Push: true, Triage: true, Pull: true},
-		CreatedAt:     ts,
-		UpdatedAt:     ts,
-		HasIssues:     true,
-	}
-}
-
 type restLabel struct {
 	ID          uint64 `json:"id"`
 	Name        string `json:"name"`
@@ -219,27 +336,162 @@ type restLabel struct {
 	Default     bool   `json:"default"`
 }
 
-type restIssue struct {
-	ID        uint64      `json:"id"`
-	Number    int         `json:"number"`
-	Title     string      `json:"title"`
-	Body      string      `json:"body"`
-	State     string      `json:"state"`
-	Labels    []restLabel `json:"labels"`
-	User      restUser    `json:"user"`
-	Comments  int         `json:"comments"`
-	CreatedAt string      `json:"created_at"`
-	UpdatedAt string      `json:"updated_at"`
-	ClosedAt  any         `json:"closed_at"`
+// appendLabelJSON appends one label object; Description is always "" and
+// Default always false on this surface.
+func appendLabelJSON(dst []byte, l restLabel) []byte {
+	dst = append(dst, `{"id":`...)
+	dst = strconv.AppendUint(dst, l.ID, 10)
+	dst = append(dst, `,"name":`...)
+	dst = appendJSONString(dst, l.Name)
+	dst = append(dst, `,"color":`...)
+	dst = appendJSONString(dst, l.Color)
+	dst = append(dst, `,"description":"","default":false}`...)
+	return dst
 }
 
-type restComment struct {
-	ID        int64    `json:"id"`
-	Body      string   `json:"body"`
-	User      restUser `json:"user"`
-	CreatedAt string   `json:"created_at"`
-	UpdatedAt string   `json:"updated_at"`
+// appendLabelListJSON appends a label array; a nil/empty list is [].
+func appendLabelListJSON(dst []byte, labels []restLabel) []byte {
+	dst = append(dst, '[')
+	for i, l := range labels {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = appendLabelJSON(dst, l)
+	}
+	return append(dst, ']')
 }
+
+// appendRepoJSON appends one repository object. Only the mutable fields
+// are read under the store lock; ID/Owner/Name/DefaultBranch are immutable
+// identity fields.
+func (h *restHandler) appendRepoJSON(dst []byte, r *Repo) []byte {
+	h.s.RLock()
+	desc, priv, seq := r.Description, r.Private, r.Seq
+	h.s.RUnlock()
+	ts := h.ts(seq)
+	dst = append(dst, `{"id":`...)
+	dst = strconv.AppendInt(dst, r.ID, 10)
+	dst = append(dst, `,"name":`...)
+	dst = appendJSONString(dst, r.Name)
+	dst = append(dst, `,"full_name":`...)
+	dst = appendJSONStringParts(dst, r.Owner, "/", r.Name)
+	dst = append(dst, `,"owner":`...)
+	dst = appendJSONUser(dst, r.Owner, ViewerID)
+	dst = append(dst, `,"private":`...)
+	dst = strconv.AppendBool(dst, priv)
+	dst = append(dst, `,"description":`...)
+	dst = appendJSONString(dst, desc)
+	dst = append(dst, `,"default_branch":`...)
+	dst = appendJSONString(dst, r.DefaultBranch)
+	dst = append(dst, `,"permissions":{"admin":true,"maintain":true,"push":true,"triage":true,"pull":true},"created_at":`...)
+	dst = appendJSONString(dst, ts)
+	dst = append(dst, `,"updated_at":`...)
+	dst = appendJSONString(dst, ts)
+	dst = append(dst, `,"has_issues":true,"fork":false,"archived":false}`...)
+	return dst
+}
+
+// appendIssueJSON appends one issue object from a snapshot.
+func (h *restHandler) appendIssueJSON(dst []byte, snap restIssueSnapshot) []byte {
+	ts := h.ts(snap.Seq)
+	dst = append(dst, `{"id":`...)
+	dst = strconv.AppendUint(dst, snap.Seq, 10)
+	dst = append(dst, `,"number":`...)
+	dst = strconv.AppendInt(dst, int64(snap.Number), 10)
+	dst = append(dst, `,"title":`...)
+	dst = appendJSONString(dst, snap.Title)
+	dst = append(dst, `,"body":`...)
+	dst = appendJSONString(dst, snap.Body)
+	dst = append(dst, `,"state":`...)
+	dst = appendJSONString(dst, snap.State)
+	dst = append(dst, `,"labels":`...)
+	dst = appendLabelListJSON(dst, snap.Labels)
+	dst = append(dst, `,"user":`...)
+	dst = appendJSONUser(dst, ViewerLogin, ViewerID)
+	dst = append(dst, `,"comments":`...)
+	dst = strconv.AppendInt(dst, int64(snap.CommentCount), 10)
+	dst = append(dst, `,"created_at":`...)
+	dst = appendJSONString(dst, ts)
+	dst = append(dst, `,"updated_at":`...)
+	dst = appendJSONString(dst, ts)
+	dst = append(dst, `,"closed_at":`...)
+	if snap.State == "closed" {
+		dst = appendJSONString(dst, ts)
+	} else {
+		dst = append(dst, "null"...)
+	}
+	return append(dst, '}')
+}
+
+// appendCommentJSON appends one issue-comment object.
+func (h *restHandler) appendCommentJSON(dst []byte, id int64, body string, seq uint64) []byte {
+	ts := h.ts(seq)
+	dst = append(dst, `{"id":`...)
+	dst = strconv.AppendInt(dst, id, 10)
+	dst = append(dst, `,"body":`...)
+	dst = appendJSONString(dst, body)
+	dst = append(dst, `,"user":`...)
+	dst = appendJSONUser(dst, ViewerLogin, ViewerID)
+	dst = append(dst, `,"created_at":`...)
+	dst = appendJSONString(dst, ts)
+	dst = append(dst, `,"updated_at":`...)
+	dst = appendJSONString(dst, ts)
+	return append(dst, '}')
+}
+
+// appendPRJSON appends one pull-request object from a snapshot.
+func (h *restHandler) appendPRJSON(dst []byte, snap restPRSnapshot) []byte {
+	ts := h.ts(snap.Seq)
+	dst = append(dst, `{"id":`...)
+	dst = strconv.AppendUint(dst, snap.Seq, 10)
+	dst = append(dst, `,"number":`...)
+	dst = strconv.AppendInt(dst, int64(snap.Number), 10)
+	dst = append(dst, `,"title":`...)
+	dst = appendJSONString(dst, snap.Title)
+	dst = append(dst, `,"body":`...)
+	dst = appendJSONString(dst, snap.Body)
+	dst = append(dst, `,"state":`...)
+	dst = appendJSONString(dst, snap.State)
+	dst = append(dst, `,"head":`...)
+	dst = appendPRRefJSON(dst, snap.HeadRef, snap.HeadSHA)
+	dst = append(dst, `,"base":`...)
+	dst = appendPRRefJSON(dst, snap.BaseRef, snap.BaseSHA)
+	dst = append(dst, `,"merged":`...)
+	dst = strconv.AppendBool(dst, snap.Merged)
+	dst = append(dst, `,"merged_at":`...)
+	if snap.MergedAt != "" {
+		dst = appendJSONString(dst, snap.MergedAt)
+	} else {
+		dst = append(dst, "null"...)
+	}
+	dst = append(dst, `,"merge_commit_sha":`...)
+	if snap.MergeCommitSHA != "" {
+		dst = appendJSONString(dst, snap.MergeCommitSHA)
+	} else {
+		dst = append(dst, "null"...)
+	}
+	dst = append(dst, `,"user":`...)
+	dst = appendJSONUser(dst, ViewerLogin, ViewerID)
+	dst = append(dst, `,"created_at":`...)
+	dst = appendJSONString(dst, ts)
+	dst = append(dst, `,"updated_at":`...)
+	dst = appendJSONString(dst, ts)
+	return append(dst, '}')
+}
+
+// appendPRRefJSON appends {"ref":...,"sha":...,"label":"<viewer>:<ref>"}.
+func appendPRRefJSON(dst []byte, ref, sha string) []byte {
+	dst = append(dst, `{"ref":`...)
+	dst = appendJSONString(dst, ref)
+	dst = append(dst, `,"sha":`...)
+	dst = appendJSONString(dst, sha)
+	dst = append(dst, `,"label":`...)
+	dst = appendJSONStringParts(dst, ViewerLogin, ":", ref)
+	return append(dst, '}')
+}
+
+// ---------------------------------------------------------------------------
+// Cold-path response shapes (still marshalled by WriteJSON).
 
 type restSHA struct {
 	SHA string `json:"sha"`
@@ -282,28 +534,6 @@ type restRef struct {
 	Object restRefObject `json:"object"`
 }
 
-type restPRRef struct {
-	Ref   string `json:"ref"`
-	SHA   string `json:"sha"`
-	Label string `json:"label"`
-}
-
-type restPull struct {
-	ID             uint64    `json:"id"`
-	Number         int       `json:"number"`
-	Title          string    `json:"title"`
-	Body           string    `json:"body"`
-	State          string    `json:"state"`
-	Head           restPRRef `json:"head"`
-	Base           restPRRef `json:"base"`
-	Merged         bool      `json:"merged"`
-	MergedAt       any       `json:"merged_at"`
-	MergeCommitSHA any       `json:"merge_commit_sha"`
-	User           restUser  `json:"user"`
-	CreatedAt      string    `json:"created_at"`
-	UpdatedAt      string    `json:"updated_at"`
-}
-
 type restPRFile struct {
 	Filename  string `json:"filename"`
 	Status    string `json:"status"`
@@ -330,7 +560,152 @@ type restContentEntry struct {
 	Size int    `json:"size"`
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Snapshots: one locked copy of an issue / PR, so encoding runs lock-free.
+// Labels are nil (encoded as []) when the issue carries none, avoiding a
+// per-request slice allocation on the read workload.
+
+type restIssueSnapshot struct {
+	Number       int
+	Title        string
+	Body         string
+	State        string
+	Labels       []restLabel // nil when empty
+	CommentCount int
+	Seq          uint64
+}
+
+func (h *restHandler) snapshotIssue(r *Repo, number int) (restIssueSnapshot, bool) {
+	h.s.RLock()
+	defer h.s.RUnlock()
+	iss, ok := r.Issues[number]
+	if !ok {
+		return restIssueSnapshot{}, false
+	}
+	snap := restIssueSnapshot{
+		Number:       iss.Number,
+		Title:        iss.Title,
+		Body:         iss.Body,
+		State:        iss.State,
+		CommentCount: len(iss.Comments),
+		Seq:          iss.Seq,
+	}
+	if len(iss.Labels) > 0 {
+		snap.Labels = make([]restLabel, 0, len(iss.Labels))
+		for _, name := range iss.Labels {
+			lj := restLabel{Name: name, Color: "ededed"}
+			if l, ok := r.Labels[name]; ok {
+				lj.Color = l.Color
+				lj.ID = l.Seq
+			}
+			snap.Labels = append(snap.Labels, lj)
+		}
+	}
+	return snap, true
+}
+
+func (h *restHandler) snapshotAllIssues(r *Repo) []restIssueSnapshot {
+	h.s.RLock()
+	defer h.s.RUnlock()
+	out := make([]restIssueSnapshot, 0, len(r.IssueOrder))
+	for _, n := range r.IssueOrder {
+		iss := r.Issues[n]
+		snap := restIssueSnapshot{
+			Number:       iss.Number,
+			Title:        iss.Title,
+			Body:         iss.Body,
+			State:        iss.State,
+			CommentCount: len(iss.Comments),
+			Seq:          iss.Seq,
+		}
+		if len(iss.Labels) > 0 {
+			snap.Labels = make([]restLabel, 0, len(iss.Labels))
+			for _, name := range iss.Labels {
+				lj := restLabel{Name: name, Color: "ededed"}
+				if l, ok := r.Labels[name]; ok {
+					lj.Color = l.Color
+					lj.ID = l.Seq
+				}
+				snap.Labels = append(snap.Labels, lj)
+			}
+		}
+		out = append(out, snap)
+	}
+	return out
+}
+
+type restPRSnapshot struct {
+	Number         int
+	Title          string
+	Body           string
+	State          string
+	HeadRef        string
+	BaseRef        string
+	HeadSHA        string
+	BaseSHA        string
+	Merged         bool
+	MergedAt       string
+	MergeCommitSHA string
+	Files          []PRFile
+	Seq            uint64
+}
+
+func (h *restHandler) snapshotPR(r *Repo, number int) (restPRSnapshot, bool) {
+	h.s.RLock()
+	defer h.s.RUnlock()
+	pr, ok := r.PRs[number]
+	if !ok {
+		return restPRSnapshot{}, false
+	}
+	snap := restPRSnapshot{
+		Number:         pr.Number,
+		Title:          pr.Title,
+		Body:           pr.Body,
+		State:          pr.State,
+		HeadRef:        pr.HeadRef,
+		BaseRef:        pr.BaseRef,
+		HeadSHA:        pr.HeadSHA,
+		BaseSHA:        pr.BaseSHA,
+		Merged:         pr.Merged,
+		MergedAt:       pr.MergedAt,
+		MergeCommitSHA: pr.MergeCommitSHA,
+		Seq:            pr.Seq,
+	}
+	if len(pr.Files) > 0 {
+		snap.Files = append([]PRFile(nil), pr.Files...)
+	}
+	return snap, true
+}
+
+func (h *restHandler) snapshotAllPRs(r *Repo) []restPRSnapshot {
+	h.s.RLock()
+	defer h.s.RUnlock()
+	out := make([]restPRSnapshot, 0, len(r.PROrder))
+	for _, n := range r.PROrder {
+		pr := r.PRs[n]
+		snap := restPRSnapshot{
+			Number:         pr.Number,
+			Title:          pr.Title,
+			Body:           pr.Body,
+			State:          pr.State,
+			HeadRef:        pr.HeadRef,
+			BaseRef:        pr.BaseRef,
+			HeadSHA:        pr.HeadSHA,
+			BaseSHA:        pr.BaseSHA,
+			Merged:         pr.Merged,
+			MergedAt:       pr.MergedAt,
+			MergeCommitSHA: pr.MergeCommitSHA,
+			Seq:            pr.Seq,
+		}
+		if len(pr.Files) > 0 {
+			snap.Files = append([]PRFile(nil), pr.Files...)
+		}
+		out = append(out, snap)
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
 // /user/*
 
 func (h *restHandler) dispatchUser(w http.ResponseWriter, r *http.Request, tail []string) {
@@ -382,22 +757,27 @@ func (h *restHandler) createRepo(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
-	WriteJSON(w, http.StatusCreated, h.repoView(repo))
+	writeRawJSON(w, http.StatusCreated, h.appendRepoJSON(make([]byte, 0, 512), repo))
 }
 
 func (h *restHandler) listUserRepos(w http.ResponseWriter, r *http.Request) {
 	repos := h.s.ListRepos(ViewerLogin)
 	page, perPage := restPageParams(r)
 	start, end := restPageBounds(page, perPage, len(repos))
-	views := make([]restRepo, 0, end-start)
-	for _, rp := range repos[start:end] {
-		views = append(views, h.repoView(rp))
-	}
 	restSetPageLinks(w, r, page, perPage, len(repos))
-	WriteJSON(w, http.StatusOK, views)
+	buf := make([]byte, 0, 512*(end-start+1))
+	buf = append(buf, '[')
+	for i, rp := range repos[start:end] {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = h.appendRepoJSON(buf, rp)
+	}
+	buf = append(buf, ']')
+	writeRawJSON(w, http.StatusOK, buf)
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // /repos/{owner}/{repo}/*
 
 func (h *restHandler) dispatchRepos(w http.ResponseWriter, r *http.Request, tail []string) {
@@ -415,7 +795,7 @@ func (h *restHandler) dispatchRepos(w http.ResponseWriter, r *http.Request, tail
 	if len(rest) == 0 {
 		switch r.Method {
 		case http.MethodGet:
-			WriteJSON(w, http.StatusOK, h.repoView(repo))
+			writeRawJSON(w, http.StatusOK, h.appendRepoJSON(make([]byte, 0, 512), repo))
 		case http.MethodPatch:
 			h.patchRepo(w, r, repo)
 		case http.MethodDelete:
@@ -463,10 +843,10 @@ func (h *restHandler) patchRepo(w http.ResponseWriter, r *http.Request, repo *Re
 		repo.Private = *req.Private
 		h.s.Unlock()
 	}
-	WriteJSON(w, http.StatusOK, h.repoView(repo))
+	writeRawJSON(w, http.StatusOK, h.appendRepoJSON(make([]byte, 0, 512), repo))
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Branches
 
 func (h *restHandler) dispatchBranches(w http.ResponseWriter, r *http.Request, repo *Repo, tail []string) {
@@ -498,7 +878,7 @@ func (h *restHandler) dispatchBranches(w http.ResponseWriter, r *http.Request, r
 	WriteJSON(w, http.StatusOK, restBranch{Name: name, Commit: restSHA{SHA: sha}, Protected: false})
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Commits
 
 // resolveCommit resolves a branch name, full ref name, or object id to a
@@ -544,7 +924,7 @@ func restParseIdent(raw, fallbackDate string) restIdent {
 
 func (h *restHandler) commitView(obj *GitObject) restCommit {
 	pc := obj.Commit
-	fallback := h.s.Timestamp(0)
+	fallback := h.ts(0)
 	author := restParseIdent(pc.Author, fallback)
 	committer := restParseIdent(pc.Committer, fallback)
 	view := restCommit{
@@ -631,7 +1011,7 @@ func (h *restHandler) dispatchCommits(w http.ResponseWriter, r *http.Request, re
 	WriteError(w, http.StatusNotFound, "Not Found")
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Git object construction for contents writes and squash merges
 
 // restTreeEntryKey is the git tree sort key: directories compare with a
@@ -736,7 +1116,7 @@ func (h *restHandler) flattenAt(r *Repo, commitSHA string) map[string]string {
 	return h.s.FlattenTree(r, treeSHA)
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Contents
 
 func (h *restHandler) dispatchContents(w http.ResponseWriter, r *http.Request, repo *Repo, tail []string) {
@@ -1033,7 +1413,7 @@ func (h *restHandler) deleteContents(w http.ResponseWriter, r *http.Request, rep
 	})
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Git refs
 
 func (h *restHandler) refView(r *Repo, ref, sha string) restRef {
@@ -1141,7 +1521,7 @@ func (h *restHandler) patchRef(w http.ResponseWriter, r *http.Request, repo *Rep
 	WriteJSON(w, http.StatusOK, h.refView(repo, fullRef, req.SHA))
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Labels
 
 func (h *restHandler) dispatchLabels(w http.ResponseWriter, r *http.Request, repo *Repo, tail []string) {
@@ -1151,11 +1531,16 @@ func (h *restHandler) dispatchLabels(w http.ResponseWriter, r *http.Request, rep
 	}
 	switch r.Method {
 	case http.MethodGet:
-		views := make([]restLabel, 0)
-		for _, l := range h.s.ListLabels(repo) {
-			views = append(views, restLabel{ID: l.Seq, Name: l.Name, Color: l.Color})
+		buf := make([]byte, 0, 256)
+		buf = append(buf, '[')
+		for i, l := range h.s.ListLabels(repo) {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = appendLabelJSON(buf, restLabel{ID: l.Seq, Name: l.Name, Color: l.Color})
 		}
-		WriteJSON(w, http.StatusOK, views)
+		buf = append(buf, ']')
+		writeRawJSON(w, http.StatusOK, buf)
 	case http.MethodPost:
 		var req struct {
 			Name  string `json:"name"`
@@ -1174,7 +1559,7 @@ func (h *restHandler) dispatchLabels(w http.ResponseWriter, r *http.Request, rep
 			color = "ededed"
 		}
 		l := h.s.CreateLabel(repo, req.Name, color)
-		WriteJSON(w, http.StatusCreated, restLabel{ID: l.Seq, Name: l.Name, Color: l.Color})
+		writeRawJSON(w, http.StatusCreated, appendLabelJSON(make([]byte, 0, 128), restLabel{ID: l.Seq, Name: l.Name, Color: l.Color}))
 	default:
 		WriteError(w, http.StatusNotFound, "Not Found")
 	}
@@ -1202,94 +1587,8 @@ func (l *restLabelInput) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Issues
-
-type restIssueSnapshot struct {
-	Number       int
-	Title        string
-	Body         string
-	State        string
-	Labels       []restLabel
-	CommentCount int
-	Seq          uint64
-}
-
-func (h *restHandler) snapshotIssue(r *Repo, number int) (restIssueSnapshot, bool) {
-	h.s.RLock()
-	defer h.s.RUnlock()
-	iss, ok := r.Issues[number]
-	if !ok {
-		return restIssueSnapshot{}, false
-	}
-	snap := restIssueSnapshot{
-		Number:       iss.Number,
-		Title:        iss.Title,
-		Body:         iss.Body,
-		State:        iss.State,
-		Labels:       make([]restLabel, 0, len(iss.Labels)),
-		CommentCount: len(iss.Comments),
-		Seq:          iss.Seq,
-	}
-	for _, name := range iss.Labels {
-		lj := restLabel{Name: name, Color: "ededed"}
-		if l, ok := r.Labels[name]; ok {
-			lj.Color = l.Color
-			lj.ID = l.Seq
-		}
-		snap.Labels = append(snap.Labels, lj)
-	}
-	return snap, true
-}
-
-func (h *restHandler) snapshotAllIssues(r *Repo) []restIssueSnapshot {
-	h.s.RLock()
-	defer h.s.RUnlock()
-	out := make([]restIssueSnapshot, 0, len(r.IssueOrder))
-	for _, n := range r.IssueOrder {
-		iss := r.Issues[n]
-		snap := restIssueSnapshot{
-			Number:       iss.Number,
-			Title:        iss.Title,
-			Body:         iss.Body,
-			State:        iss.State,
-			Labels:       make([]restLabel, 0, len(iss.Labels)),
-			CommentCount: len(iss.Comments),
-			Seq:          iss.Seq,
-		}
-		for _, name := range iss.Labels {
-			lj := restLabel{Name: name, Color: "ededed"}
-			if l, ok := r.Labels[name]; ok {
-				lj.Color = l.Color
-				lj.ID = l.Seq
-			}
-			snap.Labels = append(snap.Labels, lj)
-		}
-		out = append(out, snap)
-	}
-	return out
-}
-
-func (h *restHandler) issueView(snap restIssueSnapshot) restIssue {
-	ts := h.s.Timestamp(snap.Seq)
-	var closedAt any
-	if snap.State == "closed" {
-		closedAt = ts
-	}
-	return restIssue{
-		ID:        snap.Seq,
-		Number:    snap.Number,
-		Title:     snap.Title,
-		Body:      snap.Body,
-		State:     snap.State,
-		Labels:    snap.Labels,
-		User:      restViewer,
-		Comments:  snap.CommentCount,
-		CreatedAt: ts,
-		UpdatedAt: ts,
-		ClosedAt:  closedAt,
-	}
-}
 
 func (h *restHandler) dispatchIssues(w http.ResponseWriter, r *http.Request, repo *Repo, tail []string) {
 	if len(tail) == 0 {
@@ -1316,7 +1615,7 @@ func (h *restHandler) dispatchIssues(w http.ResponseWriter, r *http.Request, rep
 				WriteError(w, http.StatusNotFound, "Not Found")
 				return
 			}
-			WriteJSON(w, http.StatusOK, h.issueView(snap))
+			writeRawJSON(w, http.StatusOK, h.appendIssueJSON(make([]byte, 0, 512), snap))
 		case http.MethodPatch:
 			h.patchIssue(w, r, repo, number)
 		default:
@@ -1324,12 +1623,12 @@ func (h *restHandler) dispatchIssues(w http.ResponseWriter, r *http.Request, rep
 		}
 		return
 	}
+	if len(tail) != 2 {
+		WriteError(w, http.StatusNotFound, "Not Found")
+		return
+	}
 	switch tail[1] {
 	case "comments":
-		if len(tail) != 2 {
-			WriteError(w, http.StatusNotFound, "Not Found")
-			return
-		}
 		switch r.Method {
 		case http.MethodGet:
 			h.listComments(w, r, repo, number)
@@ -1339,10 +1638,6 @@ func (h *restHandler) dispatchIssues(w http.ResponseWriter, r *http.Request, rep
 			WriteError(w, http.StatusNotFound, "Not Found")
 		}
 	case "labels":
-		if len(tail) != 2 {
-			WriteError(w, http.StatusNotFound, "Not Found")
-			return
-		}
 		switch r.Method {
 		case http.MethodGet:
 			snap, ok := h.snapshotIssue(repo, number)
@@ -1350,7 +1645,7 @@ func (h *restHandler) dispatchIssues(w http.ResponseWriter, r *http.Request, rep
 				WriteError(w, http.StatusNotFound, "Not Found")
 				return
 			}
-			WriteJSON(w, http.StatusOK, snap.Labels)
+			writeRawJSON(w, http.StatusOK, appendLabelListJSON(make([]byte, 0, 128), snap.Labels))
 		case http.MethodPost:
 			h.addIssueLabels(w, r, repo, number)
 		default:
@@ -1392,12 +1687,17 @@ func (h *restHandler) listIssues(w http.ResponseWriter, r *http.Request, repo *R
 	}
 	page, perPage := restPageParams(r)
 	start, end := restPageBounds(page, perPage, len(filtered))
-	views := make([]restIssue, 0, end-start)
-	for _, snap := range filtered[start:end] {
-		views = append(views, h.issueView(snap))
-	}
 	restSetPageLinks(w, r, page, perPage, len(filtered))
-	WriteJSON(w, http.StatusOK, views)
+	buf := make([]byte, 0, 512*(end-start+1))
+	buf = append(buf, '[')
+	for i, snap := range filtered[start:end] {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = h.appendIssueJSON(buf, snap)
+	}
+	buf = append(buf, ']')
+	writeRawJSON(w, http.StatusOK, buf)
 }
 
 func (h *restHandler) createIssue(w http.ResponseWriter, r *http.Request, repo *Repo) {
@@ -1428,7 +1728,7 @@ func (h *restHandler) createIssue(w http.ResponseWriter, r *http.Request, repo *
 		WriteError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
-	WriteJSON(w, http.StatusCreated, h.issueView(snap))
+	writeRawJSON(w, http.StatusCreated, h.appendIssueJSON(make([]byte, 0, 512), snap))
 }
 
 func (h *restHandler) patchIssue(w http.ResponseWriter, r *http.Request, repo *Repo, number int) {
@@ -1475,7 +1775,7 @@ func (h *restHandler) patchIssue(w http.ResponseWriter, r *http.Request, repo *R
 		WriteError(w, http.StatusNotFound, "Not Found")
 		return
 	}
-	WriteJSON(w, http.StatusOK, h.issueView(snap))
+	writeRawJSON(w, http.StatusOK, h.appendIssueJSON(make([]byte, 0, 512), snap))
 }
 
 func (h *restHandler) createComment(w http.ResponseWriter, r *http.Request, repo *Repo, number int) {
@@ -1491,8 +1791,7 @@ func (h *restHandler) createComment(w http.ResponseWriter, r *http.Request, repo
 		WriteError(w, http.StatusNotFound, "Not Found")
 		return
 	}
-	ts := h.s.Timestamp(c.Seq)
-	WriteJSON(w, http.StatusCreated, restComment{ID: c.ID, Body: c.Body, User: restViewer, CreatedAt: ts, UpdatedAt: ts})
+	writeRawJSON(w, http.StatusCreated, h.appendCommentJSON(make([]byte, 0, 256), c.ID, c.Body, c.Seq))
 }
 
 func (h *restHandler) listComments(w http.ResponseWriter, r *http.Request, repo *Repo, number int) {
@@ -1501,12 +1800,16 @@ func (h *restHandler) listComments(w http.ResponseWriter, r *http.Request, repo 
 		WriteError(w, http.StatusNotFound, "Not Found")
 		return
 	}
-	views := make([]restComment, 0, len(comments))
-	for _, c := range comments {
-		ts := h.s.Timestamp(c.Seq)
-		views = append(views, restComment{ID: c.ID, Body: c.Body, User: restViewer, CreatedAt: ts, UpdatedAt: ts})
+	buf := make([]byte, 0, 256*(len(comments)+1))
+	buf = append(buf, '[')
+	for i, c := range comments {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = h.appendCommentJSON(buf, c.ID, c.Body, c.Seq)
 	}
-	WriteJSON(w, http.StatusOK, views)
+	buf = append(buf, ']')
+	writeRawJSON(w, http.StatusOK, buf)
 }
 
 // restLabelNameOf extracts a label name from a decoded JSON value (a bare
@@ -1578,111 +1881,11 @@ func (h *restHandler) addIssueLabels(w http.ResponseWriter, r *http.Request, rep
 		WriteError(w, http.StatusNotFound, "Not Found")
 		return
 	}
-	WriteJSON(w, http.StatusOK, snap.Labels)
+	writeRawJSON(w, http.StatusOK, appendLabelListJSON(make([]byte, 0, 128), snap.Labels))
 }
 
-// -------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Pull requests
-
-type restPRSnapshot struct {
-	Number         int
-	Title          string
-	Body           string
-	State          string
-	HeadRef        string
-	BaseRef        string
-	HeadSHA        string
-	BaseSHA        string
-	Merged         bool
-	MergedAt       string
-	MergeCommitSHA string
-	Files          []PRFile
-	Seq            uint64
-}
-
-func (h *restHandler) snapshotPR(r *Repo, number int) (restPRSnapshot, bool) {
-	h.s.RLock()
-	defer h.s.RUnlock()
-	pr, ok := r.PRs[number]
-	if !ok {
-		return restPRSnapshot{}, false
-	}
-	return restPRSnapshot{
-		Number:         pr.Number,
-		Title:          pr.Title,
-		Body:           pr.Body,
-		State:          pr.State,
-		HeadRef:        pr.HeadRef,
-		BaseRef:        pr.BaseRef,
-		HeadSHA:        pr.HeadSHA,
-		BaseSHA:        pr.BaseSHA,
-		Merged:         pr.Merged,
-		MergedAt:       pr.MergedAt,
-		MergeCommitSHA: pr.MergeCommitSHA,
-		Files:          append([]PRFile(nil), pr.Files...),
-		Seq:            pr.Seq,
-	}, true
-}
-
-func (h *restHandler) snapshotAllPRs(r *Repo) []restPRSnapshot {
-	h.s.RLock()
-	defer h.s.RUnlock()
-	out := make([]restPRSnapshot, 0, len(r.PROrder))
-	for _, n := range r.PROrder {
-		pr := r.PRs[n]
-		out = append(out, restPRSnapshot{
-			Number:         pr.Number,
-			Title:          pr.Title,
-			Body:           pr.Body,
-			State:          pr.State,
-			HeadRef:        pr.HeadRef,
-			BaseRef:        pr.BaseRef,
-			HeadSHA:        pr.HeadSHA,
-			BaseSHA:        pr.BaseSHA,
-			Merged:         pr.Merged,
-			MergedAt:       pr.MergedAt,
-			MergeCommitSHA: pr.MergeCommitSHA,
-			Files:          append([]PRFile(nil), pr.Files...),
-			Seq:            pr.Seq,
-		})
-	}
-	return out
-}
-
-func (h *restHandler) prView(snap restPRSnapshot) restPull {
-	ts := h.s.Timestamp(snap.Seq)
-	var mergedAt any
-	if snap.MergedAt != "" {
-		mergedAt = snap.MergedAt
-	}
-	var mergeSHA any
-	if snap.MergeCommitSHA != "" {
-		mergeSHA = snap.MergeCommitSHA
-	}
-	return restPull{
-		ID:     snap.Seq,
-		Number: snap.Number,
-		Title:  snap.Title,
-		Body:   snap.Body,
-		State:  snap.State,
-		Head: restPRRef{
-			Ref:   snap.HeadRef,
-			SHA:   snap.HeadSHA,
-			Label: ViewerLogin + ":" + snap.HeadRef,
-		},
-		Base: restPRRef{
-			Ref:   snap.BaseRef,
-			SHA:   snap.BaseSHA,
-			Label: ViewerLogin + ":" + snap.BaseRef,
-		},
-		Merged:         snap.Merged,
-		MergedAt:       mergedAt,
-		MergeCommitSHA: mergeSHA,
-		User:           restViewer,
-		CreatedAt:      ts,
-		UpdatedAt:      ts,
-	}
-}
 
 // restStripOwnerPrefix drops a "owner:" prefix from a pull-request head ref.
 func restStripOwnerPrefix(head string) string {
@@ -1719,7 +1922,7 @@ func (h *restHandler) dispatchPulls(w http.ResponseWriter, r *http.Request, repo
 			WriteError(w, http.StatusNotFound, "Not Found")
 			return
 		}
-		WriteJSON(w, http.StatusOK, h.prView(snap))
+		writeRawJSON(w, http.StatusOK, h.appendPRJSON(make([]byte, 0, 512), snap))
 		return
 	}
 	if len(tail) != 2 {
@@ -1783,12 +1986,17 @@ func (h *restHandler) listPulls(w http.ResponseWriter, r *http.Request, repo *Re
 	}
 	page, perPage := restPageParams(r)
 	start, end := restPageBounds(page, perPage, len(filtered))
-	views := make([]restPull, 0, end-start)
-	for _, snap := range filtered[start:end] {
-		views = append(views, h.prView(snap))
-	}
 	restSetPageLinks(w, r, page, perPage, len(filtered))
-	WriteJSON(w, http.StatusOK, views)
+	buf := make([]byte, 0, 512*(end-start+1))
+	buf = append(buf, '[')
+	for i, snap := range filtered[start:end] {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = h.appendPRJSON(buf, snap)
+	}
+	buf = append(buf, ']')
+	writeRawJSON(w, http.StatusOK, buf)
 }
 
 func (h *restHandler) createPull(w http.ResponseWriter, r *http.Request, repo *Repo) {
@@ -1825,7 +2033,7 @@ func (h *restHandler) createPull(w http.ResponseWriter, r *http.Request, repo *R
 		WriteError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
-	WriteJSON(w, http.StatusCreated, h.prView(snap))
+	writeRawJSON(w, http.StatusCreated, h.appendPRJSON(make([]byte, 0, 512), snap))
 }
 
 func (h *restHandler) mergePull(w http.ResponseWriter, r *http.Request, repo *Repo, number int) {

@@ -69,8 +69,11 @@ Builds, starts the binary, and runs the kit's conformance suite
 Complete: all four surfaces are implemented over the shared store — REST v3
 (`rest.go`), git smart HTTP (`git.go`, `pack.go`), GraphQL v4 (`graphql.go`),
 and MCP (`mcp.go`). Verified locally against the kit conformance suite:
-120/120 checks passing, including `--perf` runs (perf 173–174/200).
+120/120 checks passing, including `--perf` runs (perf 183–185/200 across
+three local runs, median 184; per-workload medians push 390 ms, clone
+148 ms, read 633 ms, write 101 ms).
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+<sub>Entered on [make.fun](https://make.fun/?ref=073t4skd&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>

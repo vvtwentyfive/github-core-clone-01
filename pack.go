@@ -5,6 +5,15 @@
 // decodes packfiles with full OFS_DELTA and REF_DELTA resolution, including
 // delta chains, and verifies the trailer checksum. ParsePackWithResolver
 // additionally resolves thin-pack REF_DELTA bases already held in the store.
+//
+// Performance shape (v2): zlib writers and readers are pooled (a fresh
+// compressor/decompressor per entry costs Huffman-table setup every time);
+// BuildPack's SHA-1 trailer is computed once over the finished bytes; and
+// PackCache memoizes built pack bytes keyed by (repo generation + wants +
+// haves + depth) with single-flight builds, so concurrent clones of the
+// same repo at the same generation share one build. The generation in the
+// key is the invalidation: any push bumps it and old entries simply never
+// match again.
 
 package main
 
@@ -17,7 +26,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strconv"
+	"sort"
+	"strings"
+	"sync"
 )
 
 // PktFlushBytes is the flush packet ("0000").
@@ -25,6 +36,18 @@ var PktFlushBytes = []byte("0000")
 
 // PktDelimBytes is the delimiter packet ("0001").
 var PktDelimBytes = []byte("0001")
+
+var pktHexDigits = []byte("0123456789abcdef")
+
+// appendPktLen appends a 4-hex-digit length (including the 4 length bytes).
+func appendPktLen(dst []byte, n int) []byte {
+	return append(dst,
+		pktHexDigits[(n>>12)&0xf],
+		pktHexDigits[(n>>8)&0xf],
+		pktHexDigits[(n>>4)&0xf],
+		pktHexDigits[n&0xf],
+	)
+}
 
 // EncodePktLine frames payload as one pkt-line: a 4-hex-digit length
 // (including the 4 length bytes) followed by the payload.
@@ -34,9 +57,8 @@ func EncodePktLine(payload []byte) ([]byte, error) {
 		return nil, fmt.Errorf("pkt-line too large: %d bytes", len(payload))
 	}
 	out := make([]byte, 0, n)
-	out = append(out, []byte(fmt.Sprintf("%04x", n))...)
-	out = append(out, payload...)
-	return out, nil
+	out = appendPktLen(out, n)
+	return append(out, payload...), nil
 }
 
 // EncodePktLineString frames s as one pkt-line.
@@ -54,34 +76,49 @@ type PktLine struct {
 }
 
 // DecodePktLines decodes a pkt-line stream. Payload slices alias data.
+// The 4-hex-digit length is parsed by hand so decoding allocates nothing
+// per line.
 func DecodePktLines(data []byte) ([]PktLine, error) {
 	var lines []PktLine
-	rest := data
-	for len(rest) > 0 {
-		if len(rest) < 4 {
+	for off := 0; off < len(data); {
+		if len(data)-off < 4 {
 			return nil, errors.New("pkt-line: truncated length prefix")
 		}
-		n64, err := strconv.ParseUint(string(rest[:4]), 16, 16)
-		if err != nil {
-			return nil, fmt.Errorf("pkt-line: bad length %q", string(rest[:4]))
+		n := 0
+		valid := true
+		for _, c := range data[off : off+4] {
+			var v int
+			switch {
+			case c >= '0' && c <= '9':
+				v = int(c - '0')
+			case c >= 'a' && c <= 'f':
+				v = int(c-'a') + 10
+			case c >= 'A' && c <= 'F':
+				v = int(c-'A') + 10
+			default:
+				valid = false
+			}
+			n = n*16 + v
 		}
-		n := int(n64)
+		if !valid {
+			return nil, fmt.Errorf("pkt-line: bad length %q", string(data[off:off+4]))
+		}
 		switch n {
 		case 0:
 			lines = append(lines, PktLine{Flush: true})
-			rest = rest[4:]
+			off += 4
 		case 1:
 			lines = append(lines, PktLine{Delim: true})
-			rest = rest[4:]
+			off += 4
 		case 2:
 			lines = append(lines, PktLine{End: true})
-			rest = rest[4:]
+			off += 4
 		default:
-			if n < 4 || n > len(rest) {
+			if n < 4 || off+n > len(data) {
 				return nil, fmt.Errorf("pkt-line: length %d out of range", n)
 			}
-			lines = append(lines, PktLine{Payload: rest[4:n]})
-			rest = rest[n:]
+			lines = append(lines, PktLine{Payload: data[off+4 : off+n]})
+			off += n
 		}
 	}
 	return lines, nil
@@ -98,34 +135,26 @@ type PackObject struct {
 // corrupt pack cannot force an unbounded allocation.
 const gitPackMaxObjectSize = 64 << 20
 
+// Pack type codes, indexed both ways by table instead of switch: commit 1,
+// tree 2, blob 3, tag 4. ObjectType values are blob 1, tree 2, commit 3,
+// tag 4, so the forward table is keyed by ObjectType.
+var packCodeByType = [...]int{0, 3, 2, 1, 4}
+var packTypeByCode = [...]ObjectType{0, ObjCommit, ObjTree, ObjBlob, ObjTag}
+
 // gitPackTypeCode maps an object type to its pack type code.
 func gitPackTypeCode(t ObjectType) (int, bool) {
-	switch t {
-	case ObjCommit:
-		return 1, true
-	case ObjTree:
-		return 2, true
-	case ObjBlob:
-		return 3, true
-	case ObjTag:
-		return 4, true
+	if t < 1 || int(t) > 4 {
+		return 0, false
 	}
-	return 0, false
+	return packCodeByType[t], true
 }
 
 // gitPackTypeFromCode maps a pack type code back to an object type.
 func gitPackTypeFromCode(code int) (ObjectType, bool) {
-	switch code {
-	case 1:
-		return ObjCommit, true
-	case 2:
-		return ObjTree, true
-	case 3:
-		return ObjBlob, true
-	case 4:
-		return ObjTag, true
+	if code < 1 || code > 4 {
+		return 0, false
 	}
-	return 0, false
+	return packTypeByCode[code], true
 }
 
 // gitPackAppendHeader appends a pack entry header: the type in bits 4-6 of
@@ -143,20 +172,28 @@ func gitPackAppendHeader(dst []byte, typeCode, size int) []byte {
 	return append(dst, first)
 }
 
+// Pooled zlib writers: a compressor's tables are expensive to build, so
+// BuildPack reuses one writer per pack and resets it per object instead of
+// allocating a fresh writer for every entry.
+var pooledZlibWriters = sync.Pool{
+	New: func() any { return zlib.NewWriter(io.Discard) },
+}
+
 // BuildPack assembles a version-2 packfile holding the given objects, in the
 // given order, as whole objects (no deltas). The output is deterministic for
 // identical inputs: same order, same compression level, trailer SHA-1 over
-// all preceding bytes.
+// all preceding bytes, computed once.
 func BuildPack(objects []*GitObject) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.Grow(12 + len(objects)*64)
-	var header [12]byte
-	copy(header[0:4], "PACK")
-	binary.BigEndian.PutUint32(header[4:8], 2)
-	binary.BigEndian.PutUint32(header[8:12], uint32(len(objects)))
-	buf.Write(header[:])
-	zw := zlib.NewWriter(&buf)
-	for i, obj := range objects {
+	var head [12]byte
+	copy(head[0:4], "PACK")
+	binary.BigEndian.PutUint32(head[4:8], 2)
+	binary.BigEndian.PutUint32(head[8:12], uint32(len(objects)))
+	buf.Write(head[:])
+	zw := pooledZlibWriters.Get().(*zlib.Writer)
+	defer pooledZlibWriters.Put(zw)
+	for _, obj := range objects {
 		if obj == nil {
 			return nil, errors.New("pack: nil object")
 		}
@@ -166,9 +203,7 @@ func BuildPack(objects []*GitObject) ([]byte, error) {
 		}
 		var hb [10]byte
 		buf.Write(gitPackAppendHeader(hb[:0], code, len(obj.Raw)))
-		if i > 0 {
-			zw.Reset(&buf)
-		}
+		zw.Reset(&buf)
 		if _, err := zw.Write(obj.Raw); err != nil {
 			return nil, err
 		}
@@ -179,6 +214,171 @@ func BuildPack(objects []*GitObject) ([]byte, error) {
 	sum := sha1.Sum(buf.Bytes())
 	buf.Write(sum[:])
 	return buf.Bytes(), nil
+}
+
+// PackCacheKey identifies one built pack: the repo generation it was built
+// at, the sorted want and have ids, and the deepen depth (0 when no deepen
+// was requested). Two fetches with the same key hold the same objects, so
+// they pack to identical bytes.
+type PackCacheKey struct {
+	Generation uint64
+	Wants      string // "\n"-joined sorted want ids
+	Haves      string // "\n"-joined sorted have ids
+	Depth      int    // 0 when no deepen was requested
+}
+
+// PackCacheKeyFor builds a PackCacheKey from a generation and raw want/have
+// lists; the lists are sorted and deduplicated, so argument order does not
+// matter.
+func PackCacheKeyFor(generation uint64, wants, haves []string, depth int) PackCacheKey {
+	return PackCacheKey{
+		Generation: generation,
+		Wants:      joinSortedIDs(wants),
+		Haves:      joinSortedIDs(haves),
+		Depth:      depth,
+	}
+}
+
+// joinSortedIDs sorts and deduplicates ids, then joins them with "\n".
+// An empty list joins to "".
+func joinSortedIDs(ids []string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	sorted := append([]string(nil), ids...)
+	sort.Strings(sorted)
+	out := sorted[:1]
+	for _, id := range sorted[1:] {
+		if id != out[len(out)-1] {
+			out = append(out, id)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// packCacheEntry is one cached pack build; done closes when the build
+// finishes, so concurrent waiters share a single in-flight build.
+type packCacheEntry struct {
+	done chan struct{}
+	pack []byte
+	err  error
+}
+
+// PackCache memoizes built pack bytes. Entries are keyed by generation, so
+// a repo change invalidates them implicitly: a fetch at a new generation
+// can never match an entry built at an old one. DropGeneration removes
+// stale entries to bound memory; correctness never depends on it.
+type PackCache struct {
+	mu      sync.Mutex
+	entries map[PackCacheKey]*packCacheEntry
+}
+
+// NewPackCache creates an empty pack cache.
+func NewPackCache() *PackCache {
+	return &PackCache{entries: make(map[PackCacheKey]*packCacheEntry)}
+}
+
+// packCacheMaxEntries caps the cache; past it the map is reset rather than
+// grown without bound (packs are rebuilt deterministically, so dropping
+// entries only costs a rebuild).
+const packCacheMaxEntries = 512
+
+// Get returns cached pack bytes for key, if a build for it has finished
+// successfully. It never blocks on an in-flight build.
+func (c *PackCache) Get(key PackCacheKey) ([]byte, bool) {
+	c.mu.Lock()
+	e, ok := c.entries[key]
+	c.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	select {
+	case <-e.done:
+		if e.err != nil {
+			return nil, false
+		}
+		return e.pack, true
+	default:
+		return nil, false
+	}
+}
+
+// pruneLocked drops finished entries when the cache is at capacity, so a
+// burst of generations never evicts a build still in flight. Only when
+// every entry is still building does it reset the map; a dropped in-flight
+// entry is benign (its waiters already hold it, and the key rebuilds
+// deterministically). Callers hold c.mu.
+func (c *PackCache) pruneLocked() {
+	if len(c.entries) < packCacheMaxEntries {
+		return
+	}
+	for k, e := range c.entries {
+		select {
+		case <-e.done:
+			delete(c.entries, k)
+		default:
+		}
+	}
+	if len(c.entries) >= packCacheMaxEntries {
+		c.entries = make(map[PackCacheKey]*packCacheEntry, packCacheMaxEntries)
+	}
+}
+
+// Clear drops every cached pack.
+func (c *PackCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[PackCacheKey]*packCacheEntry, packCacheMaxEntries)
+}
+
+// Put stores finished pack bytes under key.
+func (c *PackCache) Put(key PackCacheKey, pack []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneLocked()
+	e := &packCacheEntry{done: make(chan struct{}), pack: pack}
+	close(e.done)
+	c.entries[key] = e
+}
+
+// GetOrBuild returns the cached pack for key, or builds it once with build
+// and caches the result. Concurrent callers for the same key share the one
+// build: the first builds while the rest wait. A failed build is not
+// cached, so a later call retries.
+func (c *PackCache) GetOrBuild(key PackCacheKey, build func() ([]byte, error)) ([]byte, error) {
+	c.mu.Lock()
+	if e, ok := c.entries[key]; ok {
+		c.mu.Unlock()
+		<-e.done
+		return e.pack, e.err
+	}
+	c.pruneLocked()
+	e := &packCacheEntry{done: make(chan struct{})}
+	c.entries[key] = e
+	c.mu.Unlock()
+	pack, err := build()
+	e.pack, e.err = pack, err
+	close(e.done)
+	if err != nil {
+		c.mu.Lock()
+		if cur, ok := c.entries[key]; ok && cur == e {
+			delete(c.entries, key)
+		}
+		c.mu.Unlock()
+	}
+	return pack, err
+}
+
+// DropGeneration removes every entry built at generation gen (stale after
+// the repo moved on). Entries for other generations are untouched.
+func (c *PackCache) DropGeneration(gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.entries {
+		if k.Generation == gen {
+			delete(c.entries, k)
+		}
+	}
 }
 
 // PackBaseResolver supplies a base object held outside the pack (a thin
@@ -196,6 +396,37 @@ func ParsePack(data []byte) ([]*PackObject, error) {
 // resolve for REF_DELTA bases that are not in the pack.
 func ParsePackWithResolver(data []byte, resolve PackBaseResolver) ([]*PackObject, error) {
 	return gitParsePack(data, resolve)
+}
+
+// Pooled zlib readers: a decompressor's tables are expensive to build, so
+// entry inflation reuses readers from the pool and resets them onto each
+// entry's byte stream instead of allocating a fresh reader per entry.
+var pooledZlibReaders sync.Pool // holds io.ReadCloser
+
+// zlibResetter is the Reset method every zlib reader carries.
+type zlibResetter interface {
+	Reset(io.Reader, []byte) error
+}
+
+// acquireZlibReader returns a reader over br, reusing a pooled one when
+// possible and allocating a fresh one otherwise.
+func acquireZlibReader(br *bytes.Reader) (io.ReadCloser, error) {
+	if v := pooledZlibReaders.Get(); v != nil {
+		zr := v.(io.ReadCloser)
+		if rz, ok := zr.(zlibResetter); ok {
+			if err := rz.Reset(br, nil); err == nil {
+				return zr, nil
+			}
+		}
+	}
+	return zlib.NewReader(br)
+}
+
+// releaseZlibReader returns a reader to the pool for reuse by a later
+// entry. No Close is needed: Reset on the next acquisition discards the
+// old stream state, and the reader holds no OS resource.
+func releaseZlibReader(zr io.ReadCloser) {
+	pooledZlibReaders.Put(zr)
 }
 
 // gitPackEntry is one raw pack entry before delta resolution.
@@ -232,8 +463,12 @@ func gitParsePack(data []byte, resolve PackBaseResolver) ([]*PackObject, error) 
 	if count > 1<<24 {
 		return nil, errors.New("pack: object count implausible")
 	}
-	entries := make([]*gitPackEntry, 0, min(count, 4096))
-	byOffset := make(map[int]*gitPackEntry, min(count, 4096))
+	capHint := count
+	if capHint > 4096 {
+		capHint = 4096
+	}
+	entries := make([]*gitPackEntry, 0, capHint)
+	byOffset := make(map[int]*gitPackEntry, capHint)
 	offset := 12
 	for i := uint32(0); i < count; i++ {
 		entryOffset := offset
@@ -294,22 +529,30 @@ func gitParsePack(data []byte, resolve PackBaseResolver) ([]*PackObject, error) 
 		default:
 			return nil, fmt.Errorf("pack: unknown entry type code %d", typeCode)
 		}
-		// Inflate exactly one zlib stream. bytes.Reader is an io.ByteReader,
-		// so the flate reader consumes exactly the stream's bytes and the
-		// reader's remaining length gives the next entry's offset.
+		// Inflate exactly one zlib stream into a buffer sized to the
+		// declared size. bytes.Reader is an io.ByteReader, so the pooled
+		// reader consumes exactly the stream's bytes and the reader's
+		// remaining length gives the next entry's offset.
 		br := bytes.NewReader(data[offset:trailerStart])
-		zr, err := zlib.NewReader(br)
+		zr, err := acquireZlibReader(br)
 		if err != nil {
 			return nil, fmt.Errorf("pack: zlib stream at %d: %w", offset, err)
 		}
-		inflated, err := io.ReadAll(io.LimitReader(zr, int64(size)+1))
-		_ = zr.Close()
-		if err != nil {
-			return nil, fmt.Errorf("pack: inflate at %d: %w", offset, err)
+		inflated := make([]byte, size)
+		got, rerr := io.ReadFull(zr, inflated)
+		if rerr != nil {
+			releaseZlibReader(zr)
+			if got < size {
+				return nil, fmt.Errorf("pack: entry at %d declares %d bytes, inflated %d", entryOffset, size, got)
+			}
+			return nil, fmt.Errorf("pack: inflate at %d: %w", offset, rerr)
 		}
-		if len(inflated) != size {
-			return nil, fmt.Errorf("pack: entry at %d declares %d bytes, inflated %d", entryOffset, size, len(inflated))
+		var extra [1]byte
+		if m, _ := zr.Read(extra[:]); m > 0 {
+			releaseZlibReader(zr)
+			return nil, fmt.Errorf("pack: entry at %d declares %d bytes, inflated more", entryOffset, size)
 		}
+		releaseZlibReader(zr)
 		offset += (trailerStart - offset) - br.Len()
 		entry.data = inflated
 		entries = append(entries, entry)
