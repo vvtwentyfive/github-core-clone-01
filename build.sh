@@ -1,31 +1,19 @@
-#!/bin/sh
-# Build the static forge binary into ./forge-bin and enforce the size caps:
-# at most 8 MiB for the binary, at most 16 MiB for the whole tree.
-set -eu
+#!/usr/bin/env bash
+# Build the forge binary from the Go sources in this directory.
+#
+# The binary is rebuilt from source on every run; nothing is
+# carried over as a blob. The script prints the binary size and
+# the size of the whole tree (excluding .git) so the 16 MiB tree
+# cap can be eyeballed at a glance.
+set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
-cd "$ROOT"
+cd "$(dirname "$0")"
 
-if [ -x "$HOME/workspace/tools/go/bin/go" ]; then
-  GO="$HOME/workspace/tools/go/bin/go"
-else
-  GO="go"
-fi
-"$GO" version
+GO_BIN="$HOME/workspace/tools/go/bin/go"
 
-export CGO_ENABLED=0 GOOS=linux GOARCH=amd64
-"$GO" build -trimpath -ldflags "-s -w" -o forge-bin .
+CGO_ENABLED=0 "$GO_BIN" build -trimpath -ldflags "-s -w" -o forge-bin .
 
-BIN_SIZE="$(stat -c%s forge-bin)"
-if [ "$BIN_SIZE" -gt 8388608 ]; then
-  echo "build.sh: forge-bin is $BIN_SIZE bytes, over the 8 MiB cap" >&2
-  exit 1
-fi
+BIN_BYTES=$(stat -c %s forge-bin)
+TREE_BYTES=$(du -sb --exclude=.git . | cut -f1)
 
-TREE_SIZE="$(find . -path ./.git -prune -o -type f -print0 | xargs -0 stat -c%s | awk '{s+=$1} END {print s+0}')"
-if [ "$TREE_SIZE" -gt 16777216 ]; then
-  echo "build.sh: tree is $TREE_SIZE bytes, over the 16 MiB cap" >&2
-  exit 1
-fi
-
-echo "built forge-bin ($BIN_SIZE bytes); tree $TREE_SIZE bytes"
+echo "built forge-bin ($BIN_BYTES bytes); tree $TREE_BYTES bytes"

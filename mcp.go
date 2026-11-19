@@ -1,252 +1,23 @@
-// MCP surface: JSON-RPC 2.0 over streamable HTTP at POST /mcp.
-//
-// Implements the modern (2026-07-28) era cleanly: server/discover,
-// initialize, tools/list, tools/call. Every tool executes against the same
-// shared store as REST and GraphQL, so effects are visible across surfaces
-// and ids are stable across reads.
-//
-// Wire contract (from the kit's mcp-client.ts / checks-mcp.ts):
-//   - server/discover returns supportedVersions (a non-empty list of
-//     YYYY-MM-DD strings), capabilities, and serverInfo;
-//   - tools/list advertises exactly the six canonical tools with non-empty
-//     descriptions and object inputSchemas, and the tools array is
-//     byte-identical across calls (the result bytes are built once and
-//     reused; handlers keep no shared mutable state, so concurrent calls
-//     keep their own ids and arguments);
-//   - tools/call answers structured content plus a text block carrying the
-//     same JSON; an unknown tool answers -32602, a call missing a required
-//     argument answers -32602, and a tool-level failure (unknown repo, merge
-//     conflict) answers isError:true;
-//   - a non-JSON body answers HTTP 400 with JSON-RPC -32700; a notification
-//     (no id) answers 202 with no body; unknown methods answer -32601, never
-//     a 500. Authentication (401) is enforced by the middleware.
-
 package main
 
 import (
-	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
 
-// mcpRevision is the protocol revision this server speaks.
+// MCP endpoint: POST /mcp, JSON-RPC 2.0 over Streamable HTTP, plain JSON
+// answers (no SSE). Speaks the 2026-07-28 revision (server/discover) and
+// the older initialize handshake for clients that predate discovery.
+
 const mcpRevision = "2026-07-28"
 
-// mcpServerName and mcpServerVersion identify the server in discover and
-// initialize answers.
-const (
-	mcpServerName    = "forge"
-	mcpServerVersion = "1.0.0"
-)
+var mcpSupportedVersions = []string{"2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
 
-// rpcRequest is one JSON-RPC request. ID stays raw so it echoes verbatim
-// (string and numeric ids alike).
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-// mcpRPCError is a JSON-RPC error object.
-type mcpRPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-// mcpRPCResponse is a JSON-RPC response envelope. Result and Error are
-// mutually exclusive; Result is raw JSON so prebuilt bytes pass through
-// unchanged.
-type mcpRPCResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *mcpRPCError    `json:"error,omitempty"`
-}
-
-func mcpWriteResult(w http.ResponseWriter, id json.RawMessage, result json.RawMessage) {
-	WriteJSON(w, http.StatusOK, mcpRPCResponse{JSONRPC: "2.0", ID: id, Result: result})
-}
-
-func mcpWriteError(w http.ResponseWriter, id json.RawMessage, code int, message string) {
-	WriteJSON(w, http.StatusOK, mcpRPCResponse{JSONRPC: "2.0", ID: id, Error: &mcpRPCError{Code: code, Message: message}})
-}
-
-func writeParseError(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
-	_, _ = w.Write([]byte("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}\n"))
-}
-
-// ---------------------------------------------------------------------------
-// Tool catalogue (built once; the bytes are reused for every tools/list call)
-// ---------------------------------------------------------------------------
-
-type mcpToolProperty struct {
-	Type        string `json:"type"`
-	Description string `json:"description"`
-}
-
-type mcpInputSchema struct {
-	Type       string                     `json:"type"`
-	Properties map[string]mcpToolProperty `json:"properties"`
-	Required   []string                   `json:"required"`
-}
-
-type mcpToolDef struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema mcpInputSchema `json:"inputSchema"`
-}
-
-func mcpTools() []mcpToolDef {
-	str := func(desc string) mcpToolProperty { return mcpToolProperty{Type: "string", Description: desc} }
-	return []mcpToolDef{
-		{
-			Name:        "create_repo",
-			Description: "Create a new repository owned by the authenticated user.",
-			InputSchema: mcpInputSchema{
-				Type: "object",
-				Properties: map[string]mcpToolProperty{
-					"owner":       str("The login of the repository owner."),
-					"name":        str("The name of the repository to create."),
-					"description": str("A description of the repository."),
-					"private":     {Type: "boolean", Description: "Whether the repository is private."},
-				},
-				Required: []string{"name"},
-			},
-		},
-		{
-			Name:        "get_repo",
-			Description: "Get a repository by owner and name.",
-			InputSchema: mcpInputSchema{
-				Type: "object",
-				Properties: map[string]mcpToolProperty{
-					"owner": str("The login of the repository owner."),
-					"repo":  str("The name of the repository."),
-				},
-				Required: []string{"owner", "repo"},
-			},
-		},
-		{
-			Name:        "create_issue",
-			Description: "Create an issue in a repository.",
-			InputSchema: mcpInputSchema{
-				Type: "object",
-				Properties: map[string]mcpToolProperty{
-					"owner": str("The login of the repository owner."),
-					"repo":  str("The name of the repository."),
-					"title": str("The title of the issue."),
-					"body":  str("The body of the issue."),
-				},
-				Required: []string{"owner", "repo", "title"},
-			},
-		},
-		{
-			Name:        "list_issues",
-			Description: "List issues in a repository.",
-			InputSchema: mcpInputSchema{
-				Type: "object",
-				Properties: map[string]mcpToolProperty{
-					"owner": str("The login of the repository owner."),
-					"repo":  str("The name of the repository."),
-					"state": str("Filter by issue state: open, closed, or all."),
-				},
-				Required: []string{"owner", "repo"},
-			},
-		},
-		{
-			Name:        "create_pull_request",
-			Description: "Create a pull request from a head branch into a base branch.",
-			InputSchema: mcpInputSchema{
-				Type: "object",
-				Properties: map[string]mcpToolProperty{
-					"owner": str("The login of the repository owner."),
-					"repo":  str("The name of the repository."),
-					"title": str("The title of the pull request."),
-					"body":  str("The body of the pull request."),
-					"head":  str("The head branch the pull request merges from."),
-					"base":  str("The base branch the pull request merges into."),
-				},
-				Required: []string{"owner", "repo", "title", "head", "base"},
-			},
-		},
-		{
-			Name:        "merge_pull_request",
-			Description: "Squash-merge a pull request into its base branch.",
-			InputSchema: mcpInputSchema{
-				Type: "object",
-				Properties: map[string]mcpToolProperty{
-					"owner":       str("The login of the repository owner."),
-					"repo":        str("The name of the repository."),
-					"pull_number": {Type: "integer", Description: "The number of the pull request to merge."},
-				},
-				Required: []string{"owner", "repo", "pull_number"},
-			},
-		},
-	}
-}
-
-// mcpMustJSON marshals a value, falling back to JSON null on error.
-func mcpMustJSON(v any) json.RawMessage {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return json.RawMessage("null")
-	}
-	return data
-}
-
-// ---------------------------------------------------------------------------
-// Handler
-// ---------------------------------------------------------------------------
-
-// RegisterMCP registers the MCP route on mux.
-func RegisterMCP(mux *Router, s *Store) {
-	// The tools/list result, built once so every call answers byte-identical
-	// bytes for the tools array.
-	toolsListResult := mcpMustJSON(map[string]any{"tools": mcpTools()})
-
-	mux.Handle(func(r *http.Request, path string) bool {
-		return r.Method == http.MethodPost && path == "/mcp"
-	}, func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<20))
-		trimmed := bytes.TrimSpace(body)
-		if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
-			writeParseError(w)
-			return
-		}
-		var req rpcRequest
-		if err := json.Unmarshal(trimmed, &req); err != nil {
-			writeParseError(w)
-			return
-		}
-		if len(req.ID) == 0 || string(req.ID) == "null" {
-			// Notification: no response body.
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-		switch req.Method {
-		case "server/discover":
-			mcpWriteResult(w, req.ID, mcpDiscoverResult())
-		case "initialize":
-			mcpWriteResult(w, req.ID, mcpInitializeResult(req.Params))
-		case "tools/list":
-			mcpWriteResult(w, req.ID, toolsListResult)
-		case "tools/call":
-			result, code, message := mcpCallTool(s, req.Params)
-			if code != 0 {
-				mcpWriteError(w, req.ID, code, message)
-				return
-			}
-			mcpWriteResult(w, req.ID, result)
-		default:
-			mcpWriteError(w, req.ID, -32601, "Method not found")
-		}
-	})
-}
+var mcpServerName = "github-core-clone"
+var mcpServerVersion = "1.0.0"
 
 func mcpServerInfo() map[string]any {
 	return map[string]any{"name": mcpServerName, "version": mcpServerVersion}
@@ -256,364 +27,495 @@ func mcpCapabilities() map[string]any {
 	return map[string]any{"tools": map[string]any{}}
 }
 
-func mcpDiscoverResult() json.RawMessage {
-	return mcpMustJSON(map[string]any{
-		"supportedVersions": []string{mcpRevision},
-		"capabilities":      mcpCapabilities(),
-		"serverInfo":        mcpServerInfo(),
-		"_meta": map[string]any{
-			"io.modelcontextprotocol/serverInfo": mcpServerInfo(),
-		},
-	})
-}
-
-// mcpIsRevision reports whether s spells a YYYY-MM-DD protocol revision.
-func mcpIsRevision(s string) bool {
-	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
-		return false
-	}
-	for i, c := range s {
-		if i == 4 || i == 7 {
-			continue
-		}
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func mcpInitializeResult(params json.RawMessage) json.RawMessage {
-	version := mcpRevision
-	if len(params) > 0 {
-		var p struct {
-			ProtocolVersion string `json:"protocolVersion"`
-		}
-		if json.Unmarshal(params, &p) == nil && mcpIsRevision(p.ProtocolVersion) {
-			version = p.ProtocolVersion
-		}
-	}
-	return mcpMustJSON(map[string]any{
-		"protocolVersion": version,
-		"capabilities":    mcpCapabilities(),
-		"serverInfo":      mcpServerInfo(),
-	})
-}
-
 // ---------------------------------------------------------------------------
-// tools/call
+// Tool catalogue: built once, reused verbatim for every tools/list answer.
 // ---------------------------------------------------------------------------
 
-// mcpCallParams is the params object of a tools/call request.
-type mcpCallParams struct {
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments"`
+var mcpToolsOnce sync.Once
+var mcpToolsCache []map[string]any
+
+func mcpStrProp(desc string) map[string]any {
+	return map[string]any{"type": "string", "description": desc}
 }
 
-// mcpCallTool executes one tools/call. A non-zero code is a JSON-RPC error;
-// otherwise result holds the tool result object (which may itself carry
-// isError:true for a tool-level failure).
-func mcpCallTool(s *Store, params json.RawMessage) (json.RawMessage, int, string) {
-	var p mcpCallParams
-	if len(params) > 0 {
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, -32602, "Invalid params"
-		}
-	}
-	if p.Arguments == nil {
-		p.Arguments = map[string]any{}
-	}
-	switch p.Name {
-	case "create_repo":
-		return mcpCreateRepo(s, p.Arguments)
-	case "get_repo":
-		return mcpGetRepo(s, p.Arguments)
-	case "create_issue":
-		return mcpCreateIssue(s, p.Arguments)
-	case "list_issues":
-		return mcpListIssues(s, p.Arguments)
-	case "create_pull_request":
-		return mcpCreatePullRequest(s, p.Arguments)
-	case "merge_pull_request":
-		return mcpMergePullRequest(s, p.Arguments)
-	case "":
-		return nil, -32602, "Invalid params: missing tool name"
-	default:
-		return nil, -32602, "Unknown tool: " + p.Name
-	}
-}
-
-// mcpArgString reads the first present non-empty string argument under any of
-// the given keys (canonical names first, then the suite's synonyms).
-func mcpArgString(args map[string]any, keys ...string) (string, bool) {
-	for _, k := range keys {
-		if v, ok := args[k]; ok {
-			if s, ok := v.(string); ok && s != "" {
-				return s, true
+func mcpToolList() []map[string]any {
+	mcpToolsOnce.Do(func() {
+		mk := func(name, desc string, props map[string]any, required []string) map[string]any {
+			return map[string]any{
+				"name":        name,
+				"description": desc,
+				"inputSchema": map[string]any{
+					"type":       "object",
+					"properties": props,
+					"required":   required,
+				},
 			}
 		}
-	}
-	return "", false
+		mcpToolsCache = []map[string]any{
+			mk("create_repo", "Create a repository owned by the viewer.", map[string]any{
+				"owner":       mcpStrProp("Login of the repository owner."),
+				"name":        mcpStrProp("Name of the repository to create."),
+				"description": mcpStrProp("Short description of the repository."),
+				"private":     map[string]any{"type": "boolean", "description": "Whether the repository is private."},
+			}, []string{"name"}),
+			mk("get_repo", "Read one repository by owner and name.", map[string]any{
+				"owner": mcpStrProp("Login of the repository owner."),
+				"repo":  mcpStrProp("Name of the repository."),
+			}, []string{"owner", "repo"}),
+			mk("create_issue", "Open an issue in a repository.", map[string]any{
+				"owner": mcpStrProp("Login of the repository owner."),
+				"repo":  mcpStrProp("Name of the repository."),
+				"title": mcpStrProp("Title of the issue."),
+				"body":  mcpStrProp("Body of the issue."),
+			}, []string{"owner", "repo", "title"}),
+			mk("list_issues", "List the issues of a repository.", map[string]any{
+				"owner": mcpStrProp("Login of the repository owner."),
+				"repo":  mcpStrProp("Name of the repository."),
+				"state": mcpStrProp("Filter by state: open, closed or all."),
+			}, []string{"owner", "repo"}),
+			mk("create_pull_request", "Open a pull request from a head branch into a base branch.", map[string]any{
+				"owner": mcpStrProp("Login of the repository owner."),
+				"repo":  mcpStrProp("Name of the repository."),
+				"title": mcpStrProp("Title of the pull request."),
+				"body":  mcpStrProp("Body of the pull request."),
+				"head":  mcpStrProp("Head branch name."),
+				"base":  mcpStrProp("Base branch name."),
+			}, []string{"owner", "repo", "title", "head", "base"}),
+			mk("merge_pull_request", "Merge an open pull request with a squash commit.", map[string]any{
+				"owner":       mcpStrProp("Login of the repository owner."),
+				"repo":        mcpStrProp("Name of the repository."),
+				"pull_number": map[string]any{"type": "integer", "description": "Number of the pull request to merge."},
+			}, []string{"owner", "repo", "pull_number"}),
+			mk("get_issue", "Read one issue by owner, repository and number.", map[string]any{
+				"owner":        mcpStrProp("Login of the repository owner."),
+				"repo":         mcpStrProp("Name of the repository."),
+				"issue_number": map[string]any{"type": "integer", "description": "Number of the issue."},
+			}, []string{"owner", "repo", "issue_number"}),
+			mk("list_repos", "List the repositories owned by a user.", map[string]any{
+				"owner": mcpStrProp("Login of the user whose repositories to list."),
+			}, []string{}),
+		}
+	})
+	return mcpToolsCache
 }
 
-// mcpArgInt reads the first present integer argument under any of the keys,
-// accepting JSON numbers and digit strings.
-func mcpArgInt(args map[string]any, keys ...string) (int, bool) {
+// ---------------------------------------------------------------------------
+// JSON views shared with the REST shapes (same store, same ids).
+// ---------------------------------------------------------------------------
+
+func (a *App) mcpUserView() map[string]any {
+	return map[string]any{"login": a.store.ViewerLogin(), "id": int64(1000), "type": "User"}
+}
+
+func (a *App) mcpRepoView(r *Repo) map[string]any {
+	return map[string]any{
+		"id":             r.ID,
+		"name":           r.Name,
+		"full_name":      r.Owner + "/" + r.Name,
+		"owner":          a.mcpUserView(),
+		"private":        r.Private,
+		"description":    r.Description,
+		"default_branch": r.DefaultBranch,
+		"permissions":    map[string]any{"admin": true, "maintain": true, "push": true, "triage": true, "pull": true},
+		"created_at":     r.CreatedAt,
+		"updated_at":     r.UpdatedAt,
+		"has_issues":     true,
+		"fork":           false,
+		"archived":       false,
+	}
+}
+
+func (a *App) mcpIssueView(r *Repo, iss *Issue) map[string]any {
+	closedAt := any(nil)
+	if iss.State == "closed" {
+		closedAt = iss.UpdatedAt
+	}
+	return map[string]any{
+		"id":         iss.ID,
+		"number":     iss.Number,
+		"title":      iss.Title,
+		"body":       iss.Body,
+		"state":      iss.State,
+		"labels":     []any{},
+		"user":       a.mcpUserView(),
+		"comments":   iss.Comments,
+		"created_at": iss.CreatedAt,
+		"updated_at": iss.UpdatedAt,
+		"closed_at":  closedAt,
+	}
+}
+
+func (a *App) mcpPullView(r *Repo, pr *Pull) map[string]any {
+	headSHA, _ := a.store.BranchTip(r, pr.Head)
+	baseSHA, _ := a.store.BranchTip(r, pr.Base)
+	mergedAt := any(nil)
+	mergeSHA := any(nil)
+	if pr.Merged {
+		mergedAt = pr.MergedAt
+		mergeSHA = pr.MergeSHA
+	}
+	return map[string]any{
+		"id":               pr.ID,
+		"number":           pr.Number,
+		"title":            pr.Title,
+		"body":             pr.Body,
+		"state":            pr.State,
+		"head":             map[string]any{"ref": pr.Head, "sha": headSHA, "label": r.Owner + ":" + pr.Head},
+		"base":             map[string]any{"ref": pr.Base, "sha": baseSHA, "label": r.Owner + ":" + pr.Base},
+		"merged":           pr.Merged,
+		"merged_at":        mergedAt,
+		"merge_commit_sha": mergeSHA,
+		"user":             a.mcpUserView(),
+		"created_at":       pr.CreatedAt,
+		"updated_at":       pr.UpdatedAt,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Argument helpers
+// ---------------------------------------------------------------------------
+
+func mcpArgStr(args map[string]any, keys ...string) string {
 	for _, k := range keys {
-		if v, ok := args[k]; ok {
-			switch n := v.(type) {
-			case float64:
-				return int(n), true
-			case int:
+		if s, ok := args[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func mcpArgBool(args map[string]any, key string) bool {
+	if b, ok := args[key].(bool); ok {
+		return b
+	}
+	return false
+}
+
+func mcpArgNum(args map[string]any, keys ...string) (int64, bool) {
+	for _, k := range keys {
+		switch v := args[k].(type) {
+		case float64:
+			return int64(v), true
+		case int64:
+			return v, true
+		case string:
+			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 				return n, true
-			case int64:
-				return int(n), true
-			case json.Number:
-				if i, err := n.Int64(); err == nil {
-					return int(i), true
-				}
-			case string:
-				if i, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
-					return i, true
-				}
+			}
+		case json.Number:
+			if n, err := v.Int64(); err == nil {
+				return n, true
 			}
 		}
 	}
 	return 0, false
 }
 
-// mcpArgBool reads the first present boolean argument under any of the keys.
-func mcpArgBool(args map[string]any, keys ...string) (bool, bool) {
-	for _, k := range keys {
-		if v, ok := args[k]; ok {
-			if b, ok := v.(bool); ok {
-				return b, true
+// splitOwnerRepo resolves owner/repo from the arguments, accepting a
+// full_name of the form "owner/repo" as a fallback.
+func mcpOwnerRepo(a *App, args map[string]any) (string, string) {
+	owner := mcpArgStr(args, "owner", "owner_login")
+	repo := mcpArgStr(args, "repo", "repository", "repository_name", "repo_name")
+	if (owner == "" || repo == "") && mcpArgStr(args, "full_name") != "" {
+		parts := strings.SplitN(mcpArgStr(args, "full_name"), "/", 2)
+		if len(parts) == 2 {
+			if owner == "" {
+				owner = parts[0]
+			}
+			if repo == "" {
+				repo = parts[1]
 			}
 		}
 	}
-	return false, false
+	if owner == "" {
+		owner = a.store.ViewerLogin()
+	}
+	return owner, repo
 }
 
-// mcpMissing answers -32602 for a missing required argument.
-func mcpMissing(name string) (json.RawMessage, int, string) {
-	return nil, -32602, "Invalid params: missing required argument: " + name
+func mcpTextResult(obj any) map[string]any {
+	raw, _ := json.Marshal(obj)
+	return map[string]any{
+		"content":           []any{map[string]any{"type": "text", "text": string(raw)}},
+		"structuredContent": obj,
+	}
 }
 
-// mcpToolResult wraps a payload as a tool result: structured content plus a
-// text block carrying the same JSON.
-func mcpToolResult(payload any) (json.RawMessage, int, string) {
-	data := mcpMustJSON(payload)
-	out := mcpMustJSON(map[string]any{
-		"content":           []any{map[string]any{"type": "text", "text": string(data)}},
-		"structuredContent": json.RawMessage(data),
-	})
-	return out, 0, ""
-}
-
-// mcpToolErrorResult wraps a tool-level failure: isError:true with a text
-// message (a JSON-RPC success carrying a failed tool outcome).
-func mcpToolErrorResult(message string) (json.RawMessage, int, string) {
-	out := mcpMustJSON(map[string]any{
-		"content": []any{map[string]any{"type": "text", "text": message}},
+func mcpErrorResult(msg string) map[string]any {
+	return map[string]any{
+		"content": []any{map[string]any{"type": "text", "text": msg}},
 		"isError": true,
-	})
-	return out, 0, ""
-}
-
-// mcpRepoJSON renders a repo the way REST does, with a stable numeric id.
-func mcpRepoJSON(s *Store, r *Repo) map[string]any {
-	s.RLock()
-	description, private := r.Description, r.Private
-	s.RUnlock()
-	return map[string]any{
-		"id":             r.ID,
-		"name":           r.Name,
-		"full_name":      r.Owner + "/" + r.Name,
-		"owner":          map[string]any{"login": r.Owner},
-		"description":    description,
-		"private":        private,
-		"default_branch": r.DefaultBranch,
 	}
 }
 
-// mcpIssueJSON renders an issue snapshot.
-func mcpIssueJSON(snap *gqlIssueSnap) map[string]any {
-	return map[string]any{
-		"id":     GlobalID("Issue", snap.repoID, snap.number),
-		"number": snap.number,
-		"title":  snap.title,
-		"body":   snap.body,
-		"state":  snap.state,
-	}
-}
+// ---------------------------------------------------------------------------
+// Tool dispatch
+// ---------------------------------------------------------------------------
 
-// mcpPRJSON renders a pull-request snapshot.
-func mcpPRJSON(snap *gqlPRSnap) map[string]any {
-	return map[string]any{
-		"id":     GlobalID("PullRequest", snap.repoID, snap.number),
-		"number": snap.number,
-		"title":  snap.title,
-		"body":   snap.body,
-		"state":  snap.state,
-		"merged": snap.merged,
-		"head":   map[string]any{"ref": snap.headRef, "sha": snap.headSHA},
-		"base":   map[string]any{"ref": snap.baseRef, "sha": snap.baseSHA},
-	}
-}
-
-func mcpCreateRepo(s *Store, args map[string]any) (json.RawMessage, int, string) {
-	name, ok := mcpArgString(args, "name", "repo", "repository", "repository_name", "repo_name")
-	if !ok {
-		return mcpMissing("name")
-	}
-	owner, ok := mcpArgString(args, "owner", "owner_login", "org", "organization", "user", "login")
-	if !ok {
-		owner = ViewerLogin
-	}
-	description, _ := mcpArgString(args, "description", "about", "summary", "body")
-	private, _ := mcpArgBool(args, "private", "is_private")
-	repo, err := s.CreateRepo(owner, name, description, private)
-	if err != nil {
-		return mcpToolErrorResult("repository already exists")
-	}
-	return mcpToolResult(mcpRepoJSON(s, repo))
-}
-
-func mcpGetRepo(s *Store, args map[string]any) (json.RawMessage, int, string) {
-	owner, ok := mcpArgString(args, "owner", "owner_login", "org", "organization", "user", "login")
-	if !ok {
-		return mcpMissing("owner")
-	}
-	name, ok := mcpArgString(args, "repo", "repository", "repository_name", "repo_name", "name")
-	if !ok {
-		return mcpMissing("repo")
-	}
-	repo, ok := s.GetRepo(owner, name)
-	if !ok {
-		return mcpToolErrorResult("repository not found")
-	}
-	return mcpToolResult(mcpRepoJSON(s, repo))
-}
-
-func mcpCreateIssue(s *Store, args map[string]any) (json.RawMessage, int, string) {
-	owner, ok := mcpArgString(args, "owner", "owner_login", "org", "organization", "user", "login")
-	if !ok {
-		return mcpMissing("owner")
-	}
-	name, ok := mcpArgString(args, "repo", "repository", "repository_name", "repo_name")
-	if !ok {
-		return mcpMissing("repo")
-	}
-	title, ok := mcpArgString(args, "title", "issue_title", "subject")
-	if !ok {
-		return mcpMissing("title")
-	}
-	body, _ := mcpArgString(args, "body", "issue_body", "description", "content", "text")
-	repo, ok := s.GetRepo(owner, name)
-	if !ok {
-		return mcpToolErrorResult("repository not found")
-	}
-	iss, err := s.CreateIssue(repo, title, body, nil)
-	if err != nil {
-		return mcpToolErrorResult(err.Error())
-	}
-	return mcpToolResult(mcpIssueJSON(gqlSnapshotIssue(s, repo, iss)))
-}
-
-func mcpListIssues(s *Store, args map[string]any) (json.RawMessage, int, string) {
-	owner, ok := mcpArgString(args, "owner", "owner_login", "org", "organization", "user", "login")
-	if !ok {
-		return mcpMissing("owner")
-	}
-	name, ok := mcpArgString(args, "repo", "repository", "repository_name", "repo_name")
-	if !ok {
-		return mcpMissing("repo")
-	}
-	state, _ := mcpArgString(args, "state", "status")
-	state = strings.ToLower(state)
-	repo, ok := s.GetRepo(owner, name)
-	if !ok {
-		return mcpToolErrorResult("repository not found")
-	}
-	var out []any
-	for _, iss := range s.ListIssues(repo) {
-		snap := gqlSnapshotIssue(s, repo, iss)
-		if state != "" && state != "all" && snap.state != state {
-			continue
+func mcpNormalize(name string) string {
+	var sb strings.Builder
+	for _, ch := range strings.ToLower(name) {
+		if ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' {
+			sb.WriteRune(ch)
 		}
-		out = append(out, mcpIssueJSON(snap))
 	}
-	if out == nil {
-		out = []any{}
-	}
-	return mcpToolResult(out)
+	return sb.String()
 }
 
-func mcpCreatePullRequest(s *Store, args map[string]any) (json.RawMessage, int, string) {
-	owner, ok := mcpArgString(args, "owner", "owner_login", "org", "organization", "user", "login")
-	if !ok {
-		return mcpMissing("owner")
-	}
-	name, ok := mcpArgString(args, "repo", "repository", "repository_name", "repo_name")
-	if !ok {
-		return mcpMissing("repo")
-	}
-	title, ok := mcpArgString(args, "title", "pr_title", "pull_request_title", "subject")
-	if !ok {
-		return mcpMissing("title")
-	}
-	head, ok := mcpArgString(args, "head", "head_ref", "head_branch", "source", "source_branch", "from_branch")
-	if !ok {
-		return mcpMissing("head")
-	}
-	base, ok := mcpArgString(args, "base", "base_ref", "base_branch", "target", "target_branch", "into_branch")
-	if !ok {
-		return mcpMissing("base")
-	}
-	body, _ := mcpArgString(args, "body", "description", "content", "text")
-	repo, ok := s.GetRepo(owner, name)
-	if !ok {
-		return mcpToolErrorResult("repository not found")
-	}
-	pr, err := s.CreatePullRequest(repo, title, body, head, base)
-	if err != nil {
-		return mcpToolErrorResult("ref not found: " + err.Error())
-	}
-	return mcpToolResult(mcpPRJSON(gqlSnapshotPR(s, repo, pr)))
+var mcpCanonicalTools = []string{
+	"create_repo", "get_repo", "create_issue", "list_issues",
+	"create_pull_request", "merge_pull_request", "get_issue", "list_repos",
 }
 
-func mcpMergePullRequest(s *Store, args map[string]any) (json.RawMessage, int, string) {
-	owner, ok := mcpArgString(args, "owner", "owner_login", "org", "organization", "user", "login")
-	if !ok {
-		return mcpMissing("owner")
-	}
-	name, ok := mcpArgString(args, "repo", "repository", "repository_name", "repo_name")
-	if !ok {
-		return mcpMissing("repo")
-	}
-	number, ok := mcpArgInt(args, "pull_number", "pull_request_number", "pr_number", "number", "issue_number")
-	if !ok {
-		return mcpMissing("pull_number")
-	}
-	repo, ok := s.GetRepo(owner, name)
-	if !ok {
-		return mcpToolErrorResult("repository not found")
-	}
-	pr, ok := s.GetPullRequest(repo, number)
-	if !ok {
-		return mcpToolErrorResult("pull request not found")
-	}
-	sha, err := gqlPerformSquashMerge(s, repo, pr)
-	if err != nil {
-		if err == errGQLMergeConflict {
-			return mcpToolErrorResult("merge conflict")
+func mcpMatchTool(name string) string {
+	norm := mcpNormalize(name)
+	for _, canon := range mcpCanonicalTools {
+		if norm == mcpNormalize(canon) {
+			return canon
 		}
-		return mcpToolErrorResult(err.Error())
 	}
-	pr, _ = s.GetPullRequest(repo, number)
-	payload := mcpPRJSON(gqlSnapshotPR(s, repo, pr))
-	payload["sha"] = sha
-	payload["merge_commit_sha"] = sha
-	payload["message"] = "Pull request successfully merged"
-	return mcpToolResult(payload)
+	for _, canon := range mcpCanonicalTools {
+		want := mcpNormalize(canon)
+		if len(norm) > len(want) && strings.HasSuffix(norm, want) {
+			return canon
+		}
+	}
+	return ""
+}
+
+func (a *App) mcpCallTool(name string, args map[string]any) (map[string]any, *mcpRPCError) {
+	canon := mcpMatchTool(name)
+	if canon == "" {
+		return nil, &mcpRPCError{code: -32601, message: "Unknown tool: " + name}
+	}
+	missing := func(fields ...string) (map[string]any, *mcpRPCError) {
+		for _, f := range fields {
+			if mcpArgStr(args, f) == "" {
+				return mcpErrorResult("Missing required argument: " + f), nil
+			}
+		}
+		return nil, nil
+	}
+	switch canon {
+	case "create_repo":
+		if res, rpcErr := missing("name"); res != nil || rpcErr != nil {
+			return res, rpcErr
+		}
+		owner := mcpArgStr(args, "owner", "owner_login")
+		if owner == "" {
+			owner = a.store.ViewerLogin()
+		}
+		r, err := a.store.CreateRepo(owner, mcpArgStr(args, "name"), mcpArgStr(args, "description"), mcpArgBool(args, "private"))
+		if err != nil {
+			return mcpErrorResult("create_repo: " + err.Error()), nil
+		}
+		return mcpTextResult(a.mcpRepoView(r)), nil
+	case "get_repo":
+		if res, rpcErr := missing("owner", "repo"); res != nil || rpcErr != nil {
+			return res, rpcErr
+		}
+		owner, repo := mcpOwnerRepo(a, args)
+		r := a.store.GetRepo(owner, repo)
+		if r == nil {
+			return mcpErrorResult("Repository not found: " + owner + "/" + repo), nil
+		}
+		return mcpTextResult(a.mcpRepoView(r)), nil
+	case "create_issue":
+		if res, rpcErr := missing("owner", "repo", "title"); res != nil || rpcErr != nil {
+			return res, rpcErr
+		}
+		owner, repo := mcpOwnerRepo(a, args)
+		r := a.store.GetRepo(owner, repo)
+		if r == nil {
+			return mcpErrorResult("Repository not found: " + owner + "/" + repo), nil
+		}
+		iss, err := a.store.CreateIssue(r, mcpArgStr(args, "title"), mcpArgStr(args, "body"), nil)
+		if err != nil {
+			return mcpErrorResult("create_issue: " + err.Error()), nil
+		}
+		return mcpTextResult(a.mcpIssueView(r, iss)), nil
+	case "list_issues":
+		if res, rpcErr := missing("owner", "repo"); res != nil || rpcErr != nil {
+			return res, rpcErr
+		}
+		owner, repo := mcpOwnerRepo(a, args)
+		r := a.store.GetRepo(owner, repo)
+		if r == nil {
+			return mcpErrorResult("Repository not found: " + owner + "/" + repo), nil
+		}
+		state := strings.ToLower(mcpArgStr(args, "state"))
+		if state == "all" {
+			state = ""
+		}
+		issues := a.store.ListIssues(r, state)
+		views := make([]any, 0, len(issues))
+		for _, iss := range issues {
+			views = append(views, a.mcpIssueView(r, iss))
+		}
+		return mcpTextResult(views), nil
+	case "create_pull_request":
+		if res, rpcErr := missing("owner", "repo", "title", "head", "base"); res != nil || rpcErr != nil {
+			return res, rpcErr
+		}
+		owner, repo := mcpOwnerRepo(a, args)
+		r := a.store.GetRepo(owner, repo)
+		if r == nil {
+			return mcpErrorResult("Repository not found: " + owner + "/" + repo), nil
+		}
+		pr, err := a.store.CreatePull(r, mcpArgStr(args, "title"), mcpArgStr(args, "head"), mcpArgStr(args, "base"), mcpArgStr(args, "body"))
+		if err != nil {
+			return mcpErrorResult("create_pull_request: " + err.Error()), nil
+		}
+		return mcpTextResult(a.mcpPullView(r, pr)), nil
+	case "merge_pull_request":
+		if res, rpcErr := missing("owner", "repo"); res != nil || rpcErr != nil {
+			return res, rpcErr
+		}
+		num, ok := mcpArgNum(args, "pull_number", "pull_request_number", "pr_number", "number")
+		if !ok || num <= 0 {
+			return mcpErrorResult("Missing required argument: pull_number"), nil
+		}
+		owner, repo := mcpOwnerRepo(a, args)
+		r := a.store.GetRepo(owner, repo)
+		if r == nil {
+			return mcpErrorResult("Repository not found: " + owner + "/" + repo), nil
+		}
+		sha, err := a.store.MergePull(r, int(num))
+		if err != nil {
+			return mcpErrorResult("merge_pull_request: " + err.Error()), nil
+		}
+		pr := a.store.GetPull(r, int(num))
+		view := a.mcpPullView(r, pr)
+		view["sha"] = sha
+		return mcpTextResult(view), nil
+	case "get_issue":
+		if res, rpcErr := missing("owner", "repo"); res != nil || rpcErr != nil {
+			return res, rpcErr
+		}
+		num, ok := mcpArgNum(args, "issue_number", "number")
+		if !ok || num <= 0 {
+			return mcpErrorResult("Missing required argument: issue_number"), nil
+		}
+		owner, repo := mcpOwnerRepo(a, args)
+		r := a.store.GetRepo(owner, repo)
+		if r == nil {
+			return mcpErrorResult("Repository not found: " + owner + "/" + repo), nil
+		}
+		iss := a.store.GetIssue(r, int(num))
+		if iss == nil {
+			return mcpErrorResult("Issue not found"), nil
+		}
+		return mcpTextResult(a.mcpIssueView(r, iss)), nil
+	case "list_repos":
+		owner := mcpArgStr(args, "owner", "owner_login")
+		if owner == "" {
+			owner = a.store.ViewerLogin()
+		}
+		repos := a.store.ListRepos(owner)
+		views := make([]any, 0, len(repos))
+		for _, r := range repos {
+			views = append(views, a.mcpRepoView(r))
+		}
+		return mcpTextResult(views), nil
+	}
+	return nil, &mcpRPCError{code: -32601, message: "Unknown tool: " + name}
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC plumbing
+// ---------------------------------------------------------------------------
+
+type mcpRPCError struct {
+	code    int
+	message string
+}
+
+func (a *App) mcpReply(w http.ResponseWriter, id any, result any, rpcErr *mcpRPCError) {
+	resp := map[string]any{"jsonrpc": "2.0", "id": id}
+	if rpcErr != nil {
+		resp["error"] = map[string]any{"code": rpcErr.code, "message": rpcErr.message}
+	} else {
+		resp["result"] = result
+	}
+	WriteJSON(w, http.StatusOK, resp)
+}
+
+func (a *App) handleMCP(w http.ResponseWriter, r *http.Request) {
+	if !a.requireAuth(w, r) {
+		return
+	}
+	raw := BodyBytes(r)
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil || parsed == nil {
+		WriteJSON(w, http.StatusBadRequest, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      nil,
+			"error":   map[string]any{"code": -32700, "message": "Parse error"},
+		})
+		return
+	}
+	method, _ := parsed["method"].(string)
+	params, _ := parsed["params"].(map[string]any)
+	if params == nil {
+		params = map[string]any{}
+	}
+	_, hasID := parsed["id"]
+	id := parsed["id"]
+	if method == "" {
+		a.mcpReply(w, id, nil, &mcpRPCError{code: -32600, message: "Invalid Request: missing method"})
+		return
+	}
+	if strings.HasPrefix(method, "notifications/") || !hasID {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	switch method {
+	case "server/discover":
+		a.mcpReply(w, id, map[string]any{
+			"resultType":        "discover",
+			"supportedVersions": mcpSupportedVersions,
+			"capabilities":      mcpCapabilities(),
+			"instructions":      "GitHub core clone: repositories, issues and pull requests over MCP tools.",
+			"serverInfo":        mcpServerInfo(),
+			"_meta": map[string]any{
+				"io.modelcontextprotocol/serverInfo": mcpServerInfo(),
+			},
+		}, nil)
+	case "initialize":
+		version := mcpRevision
+		if offered, ok := params["protocolVersion"].(string); ok && offered != "" {
+			version = offered
+			supported := false
+			for _, v := range mcpSupportedVersions {
+				if v == offered {
+					supported = true
+					break
+				}
+			}
+			if !supported {
+				a.mcpReply(w, id, nil, &mcpRPCError{code: -32602, message: "Unsupported protocol version: " + offered})
+				return
+			}
+		}
+		w.Header().Set("Mcp-Session-Id", "mcp-session-1")
+		a.mcpReply(w, id, map[string]any{
+			"protocolVersion": version,
+			"capabilities":    mcpCapabilities(),
+			"serverInfo":      mcpServerInfo(),
+		}, nil)
+	case "ping":
+		a.mcpReply(w, id, map[string]any{}, nil)
+	case "tools/list":
+		a.mcpReply(w, id, map[string]any{"tools": mcpToolList()}, nil)
+	case "tools/call":
+		name, _ := params["name"].(string)
+		args, _ := params["arguments"].(map[string]any)
+		if args == nil {
+			args = map[string]any{}
+		}
+		result, rpcErr := a.mcpCallTool(name, args)
+		a.mcpReply(w, id, result, rpcErr)
+	default:
+		a.mcpReply(w, id, nil, &mcpRPCError{code: -32601, message: "Method not found: " + method})
+	}
 }

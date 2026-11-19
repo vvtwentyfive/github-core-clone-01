@@ -1,89 +1,90 @@
-#!/bin/sh
-# Build the binary, start it, run the kit conformance suite against it, and
-# print the score columns. The server is always killed on exit.
-set -eu
+#!/usr/bin/env bash
+# Local end-to-end check for the forge.
+#
+# Builds the binary, boots it on an ephemeral port, runs the kit's
+# conformance suite (with the benchmark workloads) against it, and
+# prints the score columns. Exits 0 only when all 120 checks pass.
+#
+# The viewer login is read from the kit's scenario BEFORE the server
+# starts, because the server needs its token at boot and the token
+# IS the viewer login (contract section 1): the same value is both
+# MAKEFUN_SHOP_TOKEN for the forge and --token for the suite.
+set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
-KIT_DIR="${KIT_DIR:-$HOME/workspace/makefun/kits/github-core-clone-01-kit}"
-NODE_BIN="${NODE_BIN:-$HOME/workspace/tools/node-v22.21.0-linux-x64/bin}"
+cd "$(dirname "$0")"
 
-"$ROOT/build.sh"
+NODE_BIN="$HOME/workspace/tools/node-v22.21.0-linux-x64/bin/node"
+KIT="$HOME/workspace/makefun/kits/github-core-clone-01-kit-new/github-core-clone-01-kit"
 
-LOG="$(mktemp)"
-RESULT="$(mktemp)"
-SUITE_ERR="$(mktemp)"
+# Build first; a failed build stops the script here.
+./build.sh
+
+LOGIN=$("$NODE_BIN" --experimental-strip-types -e "import('$KIT/sdk/conformance/wire.ts').then((m) => console.log(m.buildScenario().viewer.login))")
+if [[ -z "$LOGIN" ]]; then
+  echo "could not read the viewer login from the kit scenario" >&2
+  exit 1
+fi
+
+WORK=$(mktemp -d)
+SERVER_LOG="$WORK/forge.log"
+RESULT_JSON="$WORK/result.json"
 SERVER_PID=""
 
 cleanup() {
-  if [ -n "$SERVER_PID" ]; then
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  rm -f "$LOG" "$RESULT" "$SUITE_ERR"
+  rm -rf "$WORK"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
 
-MAKEFUN_SHOP_TOKEN=test-token "$ROOT/forge-bin" >"$LOG" 2>&1 &
+MAKEFUN_SHOP_TOKEN="$LOGIN" ./forge-bin > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
-# Wait for the PORT= startup line (up to 10 s).
+# Wait up to 10 s for the forge to print its PORT= line.
 PORT=""
-i=0
-while [ "$i" -lt 100 ]; do
-  if grep -q '^PORT=' "$LOG" 2>/dev/null; then
-    PORT="$(sed -n 's/^PORT=//p' "$LOG" | head -n1)"
+DEADLINE=$((SECONDS + 10))
+while [[ -z "$PORT" ]]; do
+  if [[ -s "$SERVER_LOG" ]] && grep -q '^PORT=[0-9][0-9]*$' "$SERVER_LOG"; then
+    PORT=$(grep -o '^PORT=[0-9][0-9]*$' "$SERVER_LOG" | head -n 1 | cut -d= -f2)
+  fi
+  if [[ -n "$PORT" ]]; then
     break
   fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "forge-bin exited before printing PORT=; its log:" >&2
+    cat "$SERVER_LOG" >&2
+    exit 1
+  fi
+  if [[ $SECONDS -ge $DEADLINE ]]; then
+    echo "timed out after 10 s waiting for PORT=; the forge log:" >&2
+    cat "$SERVER_LOG" >&2
+    exit 1
+  fi
   sleep 0.1
-  i=$((i + 1))
 done
-if [ -z "$PORT" ]; then
-  echo "test-local.sh: server did not print PORT=" >&2
-  cat "$LOG" >&2
+
+echo "forge up on port $PORT (login $LOGIN)"
+
+"$NODE_BIN" --experimental-strip-types "$KIT/sdk/run.ts" \
+  --url "http://127.0.0.1:$PORT" \
+  --token "$LOGIN" --perf --json \
+  > "$RESULT_JSON" 2> "$WORK/run.stderr" || true
+
+if ! SUMMARY=$("$NODE_BIN" -e 'const fs = require("node:fs"); const run = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); const c = run.columns; console.log(`checks: ${run.counts.passed}/${run.counts.manifest_total} passed; feature ${c.feature}; agent ${c.agent}; perf ${c.perf}; score ${c.score}; working ${c.working}`); if (run.perf && Array.isArray(run.perf.workloads)) { for (const w of run.perf.workloads) console.log(`benchmark ${w.name}: p50 ${w.p50_ms} ms`); } else { console.log("benchmark: not run"); } console.log(`PASSED=${run.counts.passed}`);' "$RESULT_JSON" 2> "$WORK/summary.stderr"); then
+  echo "could not read the suite result as JSON:" >&2
+  cat "$WORK/summary.stderr" >&2
+  echo "--- suite stderr ---" >&2
+  cat "$WORK/run.stderr" >&2
   exit 1
 fi
 
-# Wait for /healthz (up to 5 s).
-i=0
-while [ "$i" -lt 50 ]; do
-  if "$NODE_BIN/node" -e "fetch('http://127.0.0.1:$PORT/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" 2>/dev/null; then
-    break
-  fi
-  sleep 0.1
-  i=$((i + 1))
-done
+printf '%s\n' "$SUMMARY" | grep -v '^PASSED=' || true
+PASSED=$(printf '%s\n' "$SUMMARY" | sed -n 's/^PASSED=//p')
 
-NODE_VERSION="$("$NODE_BIN/node" --version)"
-if [ "$NODE_VERSION" != "v22.21.0" ]; then
-  echo "test-local.sh: expected node v22.21.0, got $NODE_VERSION" >&2
-  exit 1
+if [[ "$PASSED" -eq 120 ]]; then
+  exit 0
 fi
-
-cd "$KIT_DIR"
-set +e
-PATH="$NODE_BIN:$PATH" node --experimental-strip-types sdk/run.ts \
-  --url "http://127.0.0.1:$PORT" --token test-token --json >"$RESULT" 2>"$SUITE_ERR"
-RC=$?
-set -e
-
-# Print the columns line from the JSON result (fall back to raw output).
-"$NODE_BIN/node" -e "
-const fs = require('node:fs');
-const raw = fs.readFileSync(process.argv[1], 'utf8');
-const start = raw.indexOf('{');
-try {
-  const r = JSON.parse(start >= 0 ? raw.slice(start) : raw);
-  const cols = r.columns || r.scores || r;
-  const passed = r.counts?.passed ?? r.passed ?? cols.passed;
-  const total = r.counts?.registered ?? r.counts?.total ?? r.total ?? cols.total;
-  console.log('checks: ' + passed + '/' + total + ' passed; feature ' + cols.feature + '; agent ' + cols.agent + '; perf ' + cols.perf + '; score ' + cols.score + '; working ' + cols.working);
-} catch {
-  console.log(raw);
-}
-" "$RESULT"
-if [ "$RC" -ne 0 ]; then
-  echo '--- suite stderr ---' >&2
-  cat "$SUITE_ERR" >&2
-fi
-
-exit "$RC"
+echo "test-local: $PASSED/120 checks passed (need 120)" >&2
+exit 1

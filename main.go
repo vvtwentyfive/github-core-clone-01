@@ -1,16 +1,3 @@
-// Command forge is the entry's HTTP server: one in-memory store serving the
-// REST v3, git smart-HTTP, GraphQL v4, and MCP surfaces.
-//
-// The launcher (main.ts) spawns this binary and learns its port from the
-// first stdout line, "PORT=<n>". The server binds 127.0.0.1 on an ephemeral
-// port and serves until SIGTERM/SIGINT.
-//
-// Performance shape: the hot path is deliberately thin. The middleware reads
-// each request body at most once and hands the bytes on; JSON replies are
-// encoded into pooled buffers with an explicit Content-Length; the runtime
-// is tuned for the 2-CPU trial pod (GOMAXPROCS(2), a relaxed GC percent,
-// since the heap is only a few MB).
-
 package main
 
 import (
@@ -22,263 +9,285 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
-	"time"
+	"sync/atomic"
 )
 
-// Router is a first-match routing table. Each surface module registers its
-// routes with Handle; the first match wins and anything unmatched gets the
-// JSON 404 below.
-type Router struct {
-	routes []routeEntry
+// App is the forge server: one store, the bearer token that doubles as the
+// viewer login, and the global request-id counter.
+type App struct {
+	store *Store
+	token string
+	reqID atomic.Uint64
 }
 
-type routeEntry struct {
-	match   func(r *http.Request, path string) bool
-	handler http.HandlerFunc
+// NewApp builds a server around an existing store.
+func NewApp(store *Store) *App {
+	a := &App{store: store}
+	if store != nil {
+		a.token = store.Token()
+	}
+	return a
 }
 
-// Handle appends a route. Earlier routes win.
-func (rt *Router) Handle(match func(r *http.Request, path string) bool, handler http.HandlerFunc) {
-	rt.routes = append(rt.routes, routeEntry{match: match, handler: handler})
+// bodyCtxKey is the request-context key under which ServeHTTP stashes the
+// request body bytes it read once.
+type bodyCtxKey string
+
+const stashedBodyKey bodyCtxKey = "forge-body"
+
+// ServeHTTP is the whole front door: it stamps the request id, reads the
+// request body exactly once and stashes it, then routes.
+func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	n := a.reqID.Add(1)
+	w.Header().Set("X-GitHub-Request-Id", "req-"+strconv.FormatUint(n, 10))
+	var body []byte
+	if r.Body != nil {
+		body, _ = io.ReadAll(r.Body)
+		_ = r.Body.Close()
+	}
+	r = r.WithContext(context.WithValue(r.Context(), stashedBodyKey, body))
+	a.route(w, r)
 }
 
-func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	path := pathOf(r)
-	for i := range rt.routes {
-		if rt.routes[i].match(r, path) {
-			rt.routes[i].handler(w, r)
+// route matches method + path. Unknown paths and wrong methods are 404 JSON
+// here, before any auth check, so an unauthenticated unknown path still
+// answers 404. Auth itself lives inside each handler group.
+func (a *App) route(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	method := r.Method
+
+	if method == http.MethodGet && path == "/healthz" {
+		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	if method == http.MethodGet && (path == "/api/v3" || path == "/api/v3/") {
+		w.Header().Set("X-OAuth-Scopes", "repo, read:org")
+		WriteJSON(w, http.StatusOK, map[string]string{
+			"current_user_url": "/api/v3/user",
+			"rate_limit_url":   "/api/v3/rate_limit",
+		})
+		return
+	}
+	if method == http.MethodPost && path == "/api/graphql" {
+		a.handleGraphQL(w, r)
+		return
+	}
+	if method == http.MethodPost && path == "/mcp" {
+		a.handleMCP(w, r)
+		return
+	}
+	if strings.HasPrefix(path, "/api/v3/") {
+		if a.restRouteOK(method, path) {
+			a.handleREST(w, r)
 			return
 		}
+		WriteError(w, http.StatusNotFound, "Not Found")
+		return
+	}
+	if owner, repo, tail, ok := splitGitPath(path); ok {
+		switch {
+		case method == http.MethodGet && tail == "info/refs":
+			a.handleInfoRefs(w, r, owner, repo)
+		case method == http.MethodPost && tail == "git-upload-pack":
+			a.handleUploadPack(w, r, owner, repo)
+		case method == http.MethodPost && tail == "git-receive-pack":
+			a.handleReceivePack(w, r, owner, repo)
+		default:
+			WriteError(w, http.StatusNotFound, "Not Found")
+		}
+		return
 	}
 	WriteError(w, http.StatusNotFound, "Not Found")
 }
 
-// App carries the store and the expected bearer token for the middleware.
-type App struct {
-	store *Store
-	token string
+// splitGitPath pulls /{owner}/{repo}.git/{tail} apart. It reports false for
+// anything that is not shaped like a git smart-HTTP path.
+func splitGitPath(path string) (owner, repo, tail string, ok bool) {
+	rest := strings.TrimPrefix(path, "/")
+	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) != 3 || parts[0] == "" {
+		return "", "", "", false
+	}
+	if !strings.HasSuffix(parts[1], ".git") {
+		return "", "", "", false
+	}
+	repo = strings.TrimSuffix(parts[1], ".git")
+	if repo == "" {
+		return "", "", "", false
+	}
+	return parts[0], repo, parts[2], true
 }
 
-// bodyKey is the request-context key for bytes the middleware already read.
-type bodyKey struct{}
-
-// middleware enforces the global wire discipline, in order:
-//  1. every response gets Content-Type: application/json (handlers serving
-//     git smart-HTTP binary bodies override it before writing) and a
-//     non-empty deterministic X-GitHub-Request-Id;
-//  2. auth: every request except GET /healthz and GET /api/v3[/] needs
-//     Authorization: Bearer <MAKEFUN_SHOP_TOKEN>, else 401 JSON;
-//  3. malformed JSON bodies on the REST and GraphQL surfaces get 400 JSON.
-//     The MCP surface is excluded: it answers parse errors itself with the
-//     JSON-RPC -32700 code. Git paths carry binary bodies and are excluded.
-//
-// The body is read at most once: readJSONBody slurps it, validates it, and
-// stashes the bytes in the request context while restoring r.Body, so a
-// handler decoding it later never re-reads the socket.
-func (a *App) middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-GitHub-Request-Id", a.store.NextRequestID())
-		w.Header().Set("Content-Type", "application/json")
-		path := pathOf(r)
-		authExempt := r.Method == http.MethodGet &&
-			(path == "/healthz" || path == "/api/v3" || path == "/api/v3/")
-		if !authExempt && !a.authorized(r) {
-			WriteError(w, http.StatusUnauthorized, "Bad credentials")
-			return
+// restRouteOK validates a REST method + path shape against the route table.
+// It knows shapes only; the resource handlers behind handleREST own the rest.
+func (a *App) restRouteOK(method, path string) bool {
+	if path == "/api/v3/meta" {
+		return method == http.MethodGet
+	}
+	if path == "/api/v3/user" {
+		return method == http.MethodGet
+	}
+	if path == "/api/v3/user/repos" {
+		return method == http.MethodGet || method == http.MethodPost
+	}
+	rest, found := strings.CutPrefix(path, "/api/v3/repos/")
+	if !found {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	if len(segs) < 2 || segs[0] == "" || segs[1] == "" {
+		return false
+	}
+	tail := segs[2:]
+	switch len(tail) {
+	case 0:
+		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
+	case 1:
+		switch tail[0] {
+		case "labels", "issues", "pulls":
+			return method == http.MethodGet || method == http.MethodPost
+		case "branches", "commits":
+			return method == http.MethodGet
 		}
-		if path == "/api/graphql" || path == "/api/v3" || strings.HasPrefix(path, "/api/v3/") {
-			nr, ok := a.readJSONBody(r)
-			if !ok {
-				WriteError(w, http.StatusBadRequest, "Problems parsing JSON")
-				return
-			}
-			r = nr
+		return false
+	case 2:
+		switch tail[0] {
+		case "issues":
+			return isDigits(tail[1]) && (method == http.MethodGet || method == http.MethodPatch)
+		case "pulls":
+			return isDigits(tail[1]) && method == http.MethodGet
+		case "contents":
+			return tail[1] != "" && (method == http.MethodGet || method == http.MethodPut || method == http.MethodDelete)
+		case "branches":
+			return tail[1] != "" && method == http.MethodGet
+		case "git":
+			return tail[1] == "refs" && (method == http.MethodGet || method == http.MethodPost)
 		}
-		next.ServeHTTP(w, r)
-	})
+		return false
+	case 3:
+		if tail[0] == "contents" {
+			return method == http.MethodGet || method == http.MethodPut || method == http.MethodDelete
+		}
+		if tail[0] == "issues" && isDigits(tail[1]) && tail[2] == "comments" {
+			return method == http.MethodGet || method == http.MethodPost
+		}
+		if tail[0] == "pulls" && isDigits(tail[1]) && tail[2] == "files" {
+			return method == http.MethodGet
+		}
+		if tail[0] == "pulls" && isDigits(tail[1]) && tail[2] == "merge" {
+			return method == http.MethodPut
+		}
+		return false
+	case 4:
+		if tail[0] == "git" && tail[1] == "refs" && tail[2] == "heads" && tail[3] != "" {
+			return method == http.MethodGet
+		}
+		return false
+	default:
+		if tail[0] == "contents" {
+			return method == http.MethodGet || method == http.MethodPut || method == http.MethodDelete
+		}
+		if tail[0] == "pulls" && len(tail) == 3 && isDigits(tail[1]) && tail[2] == "merge" {
+			return method == http.MethodPut
+		}
+		return false
+	}
 }
 
-func (a *App) authorized(r *http.Request) bool {
-	if a.token == "" {
-		return true // no token configured (local runs without the env var)
+// isDigits reports whether s is a non-empty run of ASCII digits.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
 	}
-	return r.Header.Get("Authorization") == "Bearer "+a.token
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
-// readJSONBody reads a POST/PUT/PATCH body once, validates it as JSON, and
-// returns a request carrying the same bytes twice over: stashed in the
-// context for ReadJSON and rest.go's restBodyBytes, and as a fresh r.Body
-// for handlers that decode the stream themselves. Empty bodies are valid. Any other method, or a body
-// that cannot be read, passes through untouched (ok=true); a malformed
-// non-empty body reports ok=false.
-func (a *App) readJSONBody(r *http.Request) (*http.Request, bool) {
-	if r.Method != http.MethodPost && r.Method != http.MethodPut && r.Method != http.MethodPatch {
-		return r, true
-	}
-	if r.ContentLength == 0 {
-		return r, true
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
-	if err != nil {
-		return r, false
-	}
-	if len(bytes.TrimSpace(body)) != 0 && !json.Valid(body) {
-		return r, false
-	}
-	// Stash under both keys: bodyKey for ReadJSON (main.go) and
-	// restBodyKey for rest.go's restBodyBytes, so REST handlers decode
-	// the stashed bytes with no second read and no second parse.
-	ctx := context.WithValue(r.Context(), bodyKey{}, body)
-	ctx = context.WithValue(ctx, restBodyKey{}, body)
-	nr := r.WithContext(ctx)
-	nr.Body = io.NopCloser(bytes.NewReader(body))
-	return nr, true
-}
+// jsonBufPool hands out reusable staging buffers for JSON replies so the
+// common path allocates no fresh buffer per request.
+var jsonBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
-// stashedBody returns the request-body bytes the middleware already read,
-// if it read any.
-func stashedBody(r *http.Request) ([]byte, bool) {
-	body, ok := r.Context().Value(bodyKey{}).([]byte)
-	return body, ok
-}
+// fallbackBody is the static reply when a value cannot be marshalled at all.
+const fallbackBody = `{"message":"internal error"}`
 
-// pathOf returns the decoded request path, or "/" when unusable.
-func pathOf(r *http.Request) string {
-	if r.URL == nil || r.URL.Path == "" {
-		return "/"
-	}
-	return r.URL.Path
-}
-
-// jsonBufferPool recycles the scratch buffers WriteJSON encodes into, so
-// the read/write hot path does not allocate a fresh buffer per reply.
-// Buffers that grew absurdly large are dropped instead of pooled.
-var jsonBufferPool = sync.Pool{
-	New: func() any {
-		return new(bytes.Buffer)
-	},
-}
-
-// WriteJSON writes a JSON body with the given status. The bytes are
-// identical to json.Marshal(v) plus a trailing newline: encoding/json's
-// Encoder appends the newline and escapes HTML exactly like Marshal.
-// Content-Length is set explicitly so the server never falls back to
-// chunked framing on these small replies.
+// WriteJSON marshals v into a pooled buffer and writes it with an explicit
+// Content-Length and Content-Type application/json, compact, no trailing
+// newline.
 func WriteJSON(w http.ResponseWriter, status int, v any) {
-	buf := jsonBufferPool.Get().(*bytes.Buffer)
+	buf := jsonBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
-	enc := json.NewEncoder(buf)
-	if err := enc.Encode(v); err != nil {
-		jsonBufferPool.Put(buf)
+	defer jsonBufPool.Put(buf)
+	if err := json.NewEncoder(buf).Encode(v); err != nil {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(fallbackBody)))
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("{\"message\":\"Internal Server Error\"}\n"))
+		_, _ = w.Write([]byte(fallbackBody))
 		return
 	}
+	payload := buf.Bytes()
+	if n := len(payload); n > 0 && payload[n-1] == '\n' {
+		payload = payload[:n-1]
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 	w.WriteHeader(status)
-	_, _ = w.Write(buf.Bytes())
-	if buf.Cap() <= 64<<10 {
-		jsonBufferPool.Put(buf)
+	_, _ = w.Write(payload)
+}
+
+// WriteError writes {"message": msg} at the given status.
+func WriteError(w http.ResponseWriter, status int, msg string) {
+	WriteJSON(w, status, map[string]string{"message": msg})
+}
+
+// requireAuth checks Authorization: Bearer <token>. On failure it writes
+// 401 {"message":"Bad credentials"} and reports false; callers return.
+func (a *App) requireAuth(w http.ResponseWriter, r *http.Request) bool {
+	if r.Header.Get("Authorization") != "Bearer "+a.token {
+		WriteError(w, http.StatusUnauthorized, "Bad credentials")
+		return false
 	}
+	return true
 }
 
-type errorBody struct {
-	Message string `json:"message"`
-}
-
-// WriteError writes a JSON error body: {"message": ...}.
-func WriteError(w http.ResponseWriter, status int, message string) {
-	WriteJSON(w, status, errorBody{Message: message})
-}
-
-// ReadJSON decodes a JSON request body. When the middleware already read the
-// body, it decodes the stashed bytes (no second read); otherwise it decodes
-// the live stream. The middleware has already rejected malformed bodies on
-// the REST/GraphQL surfaces, so a decode error here is a shape mismatch;
-// handlers answer it with 400. A stashed blank body decodes as io.EOF,
-// exactly like the streaming decoder would report it.
-func ReadJSON(r *http.Request, v any) error {
-	if body, ok := stashedBody(r); ok {
-		if len(bytes.TrimSpace(body)) == 0 {
-			return io.EOF
-		}
-		return json.Unmarshal(body, v)
+// BodyBytes returns the request body bytes ServeHTTP read once and stashed
+// in the request context, or nil when there was no body.
+func BodyBytes(r *http.Request) []byte {
+	if r == nil {
+		return nil
 	}
-	return json.NewDecoder(r.Body).Decode(v)
-}
-
-type apiRoot struct {
-	CurrentUserURL string `json:"current_user_url"`
-	RateLimitURL   string `json:"rate_limit_url"`
-}
-
-var apiRootBody = apiRoot{
-	CurrentUserURL: "/api/v3/user",
-	RateLimitURL:   "/api/v3/rate_limit",
+	if b, ok := r.Context().Value(stashedBodyKey).([]byte); ok {
+		return b
+	}
+	return nil
 }
 
 func main() {
-	// Match the trial pod: 2 CPUs, and a small heap, so trade a little
-	// memory for far fewer GC cycles instead of the default 100% target.
 	runtime.GOMAXPROCS(2)
 	debug.SetGCPercent(300)
-
-	store := NewStore()
-	app := &App{store: store, token: os.Getenv("MAKEFUN_SHOP_TOKEN")}
-
-	mux := &Router{}
-
-	// Boot probe: no auth, 200 {"ok":true}.
-	mux.Handle(func(r *http.Request, path string) bool {
-		return r.Method == http.MethodGet && path == "/healthz"
-	}, func(w http.ResponseWriter, r *http.Request) {
-		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
-	})
-
-	// API root: 200 + scopes header.
-	mux.Handle(func(r *http.Request, path string) bool {
-		return r.Method == http.MethodGet && (path == "/api/v3" || path == "/api/v3/")
-	}, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Oauth-Scopes", "repo, read:org")
-		WriteJSON(w, http.StatusOK, apiRootBody)
-	})
-
-	RegisterREST(mux, store)
-	RegisterGit(mux, store)
-	RegisterGraphQL(mux, store)
-	RegisterMCP(mux, store)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	token := os.Getenv("MAKEFUN_SHOP_TOKEN")
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "MAKEFUN_SHOP_TOKEN is not set")
+		os.Exit(1)
+	}
+	store := NewStore(token)
+	app := NewApp(store)
+	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "listen:", err)
 		os.Exit(1)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	// FIRST stdout line: the launcher reads this to learn the port.
 	fmt.Printf("PORT=%d\n", port)
-
-	srv := &http.Server{
-		Handler:           app.middleware(mux),
-		ReadHeaderTimeout: 30 * time.Second,
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+	if err := http.Serve(ln, app); err != nil {
 		fmt.Fprintln(os.Stderr, "serve:", err)
 		os.Exit(1)
 	}

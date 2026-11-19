@@ -1,228 +1,236 @@
-// main.ts — thin launcher for the github-core-clone-01 forge.
+// Trial launcher for the github-core-clone-01 forge.
 //
-// The Go forge is vendored beside this file as "forge-bin". The trial mounts
-// the repo read-only at /bot, so the launcher copies the binary into a fresh
-// directory under the OS temp dir, makes it executable, spawns it, reads the
-// PORT=<n> line it prints on stdout, registers that port with the suite env,
-// then polls /done until the suite finishes. Node built-ins only.
-import { spawn } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+// This file serves nothing on its own. It supervises the forge
+// binary that sits beside it:
+//
+//   1. start ./forge-bin and watch its stdout for a PORT=<n> line;
+//   2. report that port to the trial environment (POST /register);
+//   3. poll GET /done until the suite says the trial is finished;
+//   4. stop the forge and leave with exit code 0.
+//
+// The forge binds an ephemeral port of its own choosing, so this
+// launcher never binds anything itself -- in particular never
+// port 8080, where the suite listens.
+//
+// The file uses only dynamic imports, plain functions and the
+// Node standard library, with no top-level await, so it loads the
+// same way whether the surrounding package treats .ts files as
+// CommonJS or as ESM.
 
-const PORT_LINE_TIMEOUT_MS = 15_000;
-const REGISTER_DEADLINE_MS = 60_000;
-const REQUEST_TIMEOUT_MS = 30_000;
-const SHUTDOWN_GRACE_MS = 5_000;
-const KILL_WAIT_MS = 2_000;
+const ENV_URL_NAME = "MAKEFUN_ENV_URL";
+const FORGE_FILE = "forge-bin";
+const PORT_LINE = /^PORT=(\d+)$/;
 
-function sleep(ms: number): Promise<void> {
+// One HTTP attempt may take at most this long before it counts as failed.
+const ATTEMPT_TIMEOUT_MS = 30_000;
+// The pause between attempts starts here, doubles after each failure,
+// and never grows past LONGEST_PAUSE_MS.
+const FIRST_PAUSE_MS = 250;
+const LONGEST_PAUSE_MS = 2000;
+// How long to wait for the forge to exit after SIGTERM before SIGKILL.
+const STOP_GRACE_MS = 5000;
+
+function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function fatal(message: string): never {
-  console.error(`main.ts: ${message}`);
-  process.exit(1);
+function growPause(currentMs) {
+  return Math.min(currentMs * 2, LONGEST_PAUSE_MS);
 }
 
-async function main(): Promise<number> {
-  const envUrlRaw = process.env.MAKEFUN_ENV_URL;
-  if (!envUrlRaw) {
-    console.error("main.ts: MAKEFUN_ENV_URL is not set");
+function shortError(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function stripTrailingSlashes(raw) {
+  return raw.replace(/\/+$/, "");
+}
+
+// Read and drop a response body so its connection can be reused.
+async function drain(response) {
+  try {
+    await response.arrayBuffer();
+  } catch {
+    // An unreadable body changes nothing about what we do next.
+  }
+}
+
+// Start the forge binary, keeping its stderr on ours and piping
+// its stdout so we can watch for the PORT= line.
+function startForge(spawn, binaryPath) {
+  return spawn(binaryPath, [], { stdio: ["ignore", "pipe", "inherit"] });
+}
+
+// Resolve with the port number from the first PORT=<n> stdout line.
+// Reject if the forge dies or cannot start before printing one.
+function waitForPort(child) {
+  return new Promise((resolve, reject) => {
+    const out = child.stdout;
+    if (!out) {
+      reject(new Error("could not read the forge's stdout"));
+      return;
+    }
+    let buffer = "";
+    let settled = false;
+    const fail = (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    };
+    child.on("error", (err) => fail(new Error(`could not start ${FORGE_FILE}: ${shortError(err)}`)));
+    child.on("exit", (code, signal) =>
+      fail(new Error(`${FORGE_FILE} left before printing its port (code ${code}, signal ${signal})`)),
+    );
+    out.on("data", (chunk) => {
+      if (settled) return;
+      buffer += chunk.toString("utf8");
+      let newline = buffer.indexOf("\n");
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline).replace(/\r$/, "").trim();
+        buffer = buffer.slice(newline + 1);
+        const match = PORT_LINE.exec(line);
+        if (match) {
+          settled = true;
+          resolve(Number(match[1]));
+          return;
+        }
+        newline = buffer.indexOf("\n");
+      }
+    });
+  });
+}
+
+// Tell the trial environment which port the forge listens on.
+// 200 and 409 both mean the registration landed; 400 and 405 mean
+// the request itself is wrong, so retrying cannot help and we stop.
+// Anything else (another status, a dropped connection, a timeout)
+// is retried with the growing pause.
+async function registerPort(base, port) {
+  const target = `${base}/register`;
+  let pauseMs = FIRST_PAUSE_MS;
+  for (;;) {
+    let response;
+    try {
+      response = await fetch(target, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ port }),
+        signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS),
+      });
+    } catch (err) {
+      process.stderr.write(`register: ${shortError(err)}; trying again in ${pauseMs} ms\n`);
+      await sleep(pauseMs);
+      pauseMs = growPause(pauseMs);
+      continue;
+    }
+    if (response.status === 200 || response.status === 409) {
+      await drain(response);
+      return;
+    }
+    if (response.status === 400 || response.status === 405) {
+      await drain(response);
+      throw new Error(`register refused with HTTP ${response.status}; giving up`);
+    }
+    await drain(response);
+    process.stderr.write(`register: HTTP ${response.status}; trying again in ${pauseMs} ms\n`);
+    await sleep(pauseMs);
+    pauseMs = growPause(pauseMs);
+  }
+}
+
+// Ask the environment whether the trial is over, until it says so.
+// A "not yet" answer, a failed attempt and an unreadable answer all
+// lead to the same thing: pause, then ask again. While polling, also
+// notice if the forge has died underneath us.
+async function waitUntilDone(base, isForgeAlive) {
+  const target = `${base}/done`;
+  let pauseMs = FIRST_PAUSE_MS;
+  for (;;) {
+    if (!isForgeAlive()) {
+      throw new Error(`${FORGE_FILE} stopped while waiting for the trial to finish`);
+    }
+    let response;
+    try {
+      response = await fetch(target, {
+        method: "GET",
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS),
+      });
+    } catch (err) {
+      process.stderr.write(`done poll: ${shortError(err)}; trying again in ${pauseMs} ms\n`);
+      await sleep(pauseMs);
+      pauseMs = growPause(pauseMs);
+      continue;
+    }
+    if (response.ok) {
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      if (payload !== null && payload.done === true) return;
+    } else {
+      await drain(response);
+      process.stderr.write(`done poll: HTTP ${response.status}; trying again in ${pauseMs} ms\n`);
+    }
+    await sleep(pauseMs);
+    pauseMs = growPause(pauseMs);
+  }
+}
+
+// Ask the forge to stop, then insist if it lingers.
+async function stopForge(child, childDone) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  const finished = await Promise.race([
+    childDone,
+    sleep(STOP_GRACE_MS).then(() => null),
+  ]);
+  if (finished === null) child.kill("SIGKILL");
+}
+
+async function main() {
+  const childProcess = await import("node:child_process");
+  const path = await import("node:path");
+
+  const rawBase = process.env[ENV_URL_NAME];
+  if (!rawBase) {
+    process.stderr.write(`error: ${ENV_URL_NAME} is not set; the trial environment did not provide it\n`);
     return 1;
   }
-  const envUrl = envUrlRaw.replace(/\/+$/, "");
+  const base = stripTrailingSlashes(rawBase);
+  const here = path.dirname(process.argv[1]);
+  const child = startForge(childProcess.spawn, path.join(here, FORGE_FILE));
 
-  // Copy the vendored binary to a fresh temp dir (repo is read-only in-trial)
-  // and make it executable before running it.
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const stagedDir = fs.mkdtempSync(path.join(os.tmpdir(), "forge-"));
-  const stagedBin = path.join(stagedDir, "forge-bin");
-  fs.copyFileSync(path.join(here, "forge-bin"), stagedBin);
-  fs.chmodSync(stagedBin, 0o755);
-
-  const child = spawn(stagedBin, [], {
-    stdio: ["ignore", "pipe", "inherit"],
-    env: process.env,
-  });
-
-  let childExited = false;
-  let childCode: number | null = null;
-  let spawnError: Error | null = null;
-  const childExit = new Promise<void>((resolve) => {
-    child.on("exit", (code) => {
-      childExited = true;
-      childCode = code;
-      resolve();
+  let childExit = null;
+  const childDone = new Promise((resolve) => {
+    child.on("exit", (code, signal) => {
+      childExit = { code, signal };
+      resolve(childExit);
     });
   });
-  child.on("error", (err) => {
-    // A spawn failure (missing/unrunnable binary) may never produce an
-    // "exit" event, so record it for the port-line wait to reject at once.
-    spawnError = err;
-    console.error(`main.ts: failed to spawn forge binary: ${err.message}`);
-  });
-
-  // Forward termination signals to the child.
-  const forward = (signal: NodeJS.Signals): void => {
-    if (!childExited) child.kill(signal);
-  };
-  process.on("SIGTERM", () => forward("SIGTERM"));
-  process.on("SIGINT", () => forward("SIGINT"));
-
-  const stopChild = async (): Promise<void> => {
-    if (childExited) return;
-    child.kill("SIGTERM");
-    const exited = await Promise.race([
-      childExit.then(() => true),
-      sleep(SHUTDOWN_GRACE_MS).then(() => false),
-    ]);
-    if (!exited && !childExited) {
-      child.kill("SIGKILL");
-      // Never hang shutdown forever if the kill itself somehow fails.
-      await Promise.race([childExit, sleep(KILL_WAIT_MS)]);
-    }
-  };
 
   try {
-    // Read the first stdout line: it must be PORT=<number>.
-    const port = await new Promise<number>((resolve, reject) => {
-      if (!child.stdout) {
-        reject(new Error("forge stdout is not piped"));
-        return;
-      }
-      if (spawnError) {
-        reject(new Error(`forge failed to spawn: ${spawnError.message}`));
-        return;
-      }
-      let buf = "";
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          reject(new Error("timed out waiting for PORT=<n> line from forge"));
-        }
-      }, PORT_LINE_TIMEOUT_MS);
-      const fail = (err: Error): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(err);
-      };
-      child.on("exit", () => {
-        if (!settled) {
-          fail(new Error("forge exited before printing PORT=<n>"));
-        }
-      });
-      child.on("error", (err) => {
-        if (!settled) fail(new Error(`forge failed to spawn: ${err.message}`));
-      });
-      // One listener for the whole run: before the port line it buffers until
-      // the newline; afterwards it keeps draining stdout and discarding it so
-      // the child can never block on a full pipe.
-      child.stdout.on("data", (chunk: Buffer) => {
-        if (settled) return;
-        buf += chunk.toString("utf8");
-        const nl = buf.indexOf("\n");
-        if (nl === -1) return;
-        const line = buf.slice(0, nl).trim();
-        const m = /^PORT=([0-9]+)$/.exec(line);
-        if (!m) {
-          fail(new Error(`malformed first stdout line from forge: ${JSON.stringify(line)}`));
-          return;
-        }
-        const parsed = Number(m[1]);
-        if (parsed < 1 || parsed > 65535) {
-          fail(new Error(`port out of range in first stdout line: ${JSON.stringify(line)}`));
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        resolve(parsed);
-      });
-    });
-    console.error(`main.ts: forge listening on port ${port}`);
-
-    // Register the port with the suite env, retrying with exponential
-    // backoff until the 60s deadline. 409 means another registration won:
-    // stop retrying and proceed. 400/405 is a contract error: abort at once.
-    const registerUrl = `${envUrl}/register`;
-    const deadline = Date.now() + REGISTER_DEADLINE_MS;
-    let delay = 250;
-    for (;;) {
-      if (Date.now() >= deadline) {
-        console.error("main.ts: register deadline (60s) exceeded");
-        return 1;
-      }
-      try {
-        const res = await fetch(registerUrl, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ port }),
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        });
-        if (res.status === 409) break;
-        if (res.status === 400 || res.status === 405) {
-          await res.text().catch(() => undefined);
-          console.error(`main.ts: register rejected with HTTP ${res.status}`);
-          return 1;
-        }
-        if (res.ok) break;
-        await res.text().catch(() => undefined);
-        console.error(`main.ts: register HTTP ${res.status}, retrying`);
-      } catch (err) {
-        console.error(`main.ts: register failed: ${(err as Error).message}, retrying`);
-      }
-      if (Date.now() >= deadline) {
-        console.error("main.ts: register deadline (60s) exceeded");
-        return 1;
-      }
-      await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
-      delay = Math.min(delay * 2, 2000);
-    }
-    console.error("main.ts: registered with env");
-
-    // Poll /done with backoff until the suite reports done. Never hold a
-    // request open: each poll is a single short request. If the child exits
-    // while waiting, abort with an error.
-    const doneUrl = `${envUrl}/done`;
-    let pollDelay = 500;
-    for (;;) {
-      if (childExited) {
-        console.error(`main.ts: forge exited (code ${childCode}) while waiting for done`);
-        return 1;
-      }
-      try {
-        const res = await fetch(doneUrl, {
-          method: "GET",
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        });
-        if (res.ok) {
-          const body = (await res.json()) as { done?: unknown };
-          if (body.done === true) {
-            console.error("main.ts: suite done");
-            return 0;
-          }
-        } else {
-          await res.text().catch(() => undefined);
-          console.error(`main.ts: /done HTTP ${res.status}, retrying`);
-        }
-      } catch (err) {
-        console.error(`main.ts: /done poll failed: ${(err as Error).message}, retrying`);
-      }
-      await Promise.race([sleep(pollDelay), childExit]);
-      pollDelay = Math.min(pollDelay * 2, 2000);
-    }
-  } catch (err) {
-    console.error(`main.ts: ${(err as Error).message}`);
-    return 1;
+    const port = await waitForPort(child);
+    process.stderr.write(`forge listening on port ${port}\n`);
+    await registerPort(base, port);
+    process.stderr.write(`registered port ${port} with the trial environment\n`);
+    await waitUntilDone(base, () => childExit === null);
+    process.stderr.write(`trial done; stopping the forge\n`);
+    return 0;
   } finally {
-    await stopChild();
+    await stopForge(child, childDone);
   }
 }
 
 main().then(
-  (code) => process.exit(code),
-  (err) => fatal(String((err as Error)?.message ?? err)),
+  (code) => {
+    process.exitCode = code;
+  },
+  (err) => {
+    process.stderr.write(`launcher failed: ${shortError(err)}\n`);
+    process.exitCode = 1;
+  },
 );

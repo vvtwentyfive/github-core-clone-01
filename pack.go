@@ -1,23 +1,14 @@
-// Pkt-line framing and packfile codec for the git protocol.
+// Git packfile codec, pack cache and pkt-line framing for the forge.
 //
-// The pkt-line helpers frame the smart-HTTP streams. BuildPack assembles
-// version-2 packfiles from whole objects (no deltas are written); ParsePack
-// decodes packfiles with full OFS_DELTA and REF_DELTA resolution, including
-// delta chains, and verifies the trailer checksum. ParsePackWithResolver
-// additionally resolves thin-pack REF_DELTA bases already held in the store.
-//
-// Performance shape (v2): zlib writers and readers are pooled (a fresh
-// compressor/decompressor per entry costs Huffman-table setup every time);
-// BuildPack's SHA-1 trailer is computed once over the finished bytes; and
-// PackCache memoizes built pack bytes keyed by (repo generation + wants +
-// haves + depth) with single-flight builds, so concurrent clones of the
-// same repo at the same generation share one build. The generation in the
-// key is the invalidation: any push bumps it and old entries simply never
-// match again.
-
+// A pack on the wire is git packfile version 2: a 12-byte header ("PACK",
+// version, object count), one zlib stream per object, and a 20-byte SHA-1
+// trailer over everything before it. This file only writes whole objects
+// (never deltas); it reads whole objects plus ofs-delta and ref-delta
+// entries so pushes from real git clients parse correctly.
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
@@ -27,638 +18,448 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
 
-// PktFlushBytes is the flush packet ("0000").
-var PktFlushBytes = []byte("0000")
+// Pack entry type codes, as git numbers them.
+const (
+	packCommit   = 1
+	packTree     = 2
+	packBlob     = 3
+	packTag      = 4
+	packOfsDelta = 6
+	packRefDelta = 7
+)
 
-// PktDelimBytes is the delimiter packet ("0001").
-var PktDelimBytes = []byte("0001")
-
-var pktHexDigits = []byte("0123456789abcdef")
-
-// appendPktLen appends a 4-hex-digit length (including the 4 length bytes).
-func appendPktLen(dst []byte, n int) []byte {
-	return append(dst,
-		pktHexDigits[(n>>12)&0xf],
-		pktHexDigits[(n>>8)&0xf],
-		pktHexDigits[(n>>4)&0xf],
-		pktHexDigits[n&0xf],
-	)
+var packTypeCodes = map[string]int{
+	"commit": packCommit,
+	"tree":   packTree,
+	"blob":   packBlob,
+	"tag":    packTag,
 }
 
-// EncodePktLine frames payload as one pkt-line: a 4-hex-digit length
-// (including the 4 length bytes) followed by the payload.
-func EncodePktLine(payload []byte) ([]byte, error) {
-	n := len(payload) + 4
-	if n > 0xffff {
-		return nil, fmt.Errorf("pkt-line too large: %d bytes", len(payload))
-	}
-	out := make([]byte, 0, n)
-	out = appendPktLen(out, n)
-	return append(out, payload...), nil
+var packCodeTypes = map[int]string{
+	packCommit: "commit",
+	packTree:   "tree",
+	packBlob:   "blob",
+	packTag:    "tag",
 }
 
-// EncodePktLineString frames s as one pkt-line.
-func EncodePktLineString(s string) ([]byte, error) {
-	return EncodePktLine([]byte(s))
-}
-
-// PktLine is one decoded pkt-line: a flush, delimiter, or response-end
-// marker, or a payload packet.
-type PktLine struct {
-	Flush   bool
-	Delim   bool
-	End     bool
-	Payload []byte
-}
-
-// DecodePktLines decodes a pkt-line stream. Payload slices alias data.
-// The 4-hex-digit length is parsed by hand so decoding allocates nothing
-// per line.
-func DecodePktLines(data []byte) ([]PktLine, error) {
-	var lines []PktLine
-	for off := 0; off < len(data); {
-		if len(data)-off < 4 {
-			return nil, errors.New("pkt-line: truncated length prefix")
-		}
-		n := 0
-		valid := true
-		for _, c := range data[off : off+4] {
-			var v int
-			switch {
-			case c >= '0' && c <= '9':
-				v = int(c - '0')
-			case c >= 'a' && c <= 'f':
-				v = int(c-'a') + 10
-			case c >= 'A' && c <= 'F':
-				v = int(c-'A') + 10
-			default:
-				valid = false
-			}
-			n = n*16 + v
-		}
-		if !valid {
-			return nil, fmt.Errorf("pkt-line: bad length %q", string(data[off:off+4]))
-		}
-		switch n {
-		case 0:
-			lines = append(lines, PktLine{Flush: true})
-			off += 4
-		case 1:
-			lines = append(lines, PktLine{Delim: true})
-			off += 4
-		case 2:
-			lines = append(lines, PktLine{End: true})
-			off += 4
-		default:
-			if n < 4 || off+n > len(data) {
-				return nil, fmt.Errorf("pkt-line: length %d out of range", n)
-			}
-			lines = append(lines, PktLine{Payload: data[off+4 : off+n]})
-			off += n
+// ObjectSHA returns the git object id: SHA-1 over "<type> <len>\0" + raw.
+// The header is built with direct byte writes into a stack buffer, no fmt.
+func ObjectSHA(typ string, raw []byte) string {
+	var hdr [48]byte
+	n := copy(hdr[:], typ)
+	hdr[n] = ' '
+	n++
+	// Decimal length, digits produced backwards then copied in order.
+	var rev [20]byte
+	m := 0
+	v := len(raw)
+	if v == 0 {
+		rev[0] = '0'
+		m = 1
+	} else {
+		for v > 0 {
+			rev[m] = byte('0' + v%10)
+			v /= 10
+			m++
 		}
 	}
-	return lines, nil
-}
-
-// PackObject is one object decoded from a packfile.
-type PackObject struct {
-	Type ObjectType
-	Raw  []byte
-	SHA  string
-}
-
-// gitPackMaxObjectSize caps one inflated object (or one delta result) so a
-// corrupt pack cannot force an unbounded allocation.
-const gitPackMaxObjectSize = 64 << 20
-
-// Pack type codes, indexed both ways by table instead of switch: commit 1,
-// tree 2, blob 3, tag 4. ObjectType values are blob 1, tree 2, commit 3,
-// tag 4, so the forward table is keyed by ObjectType.
-var packCodeByType = [...]int{0, 3, 2, 1, 4}
-var packTypeByCode = [...]ObjectType{0, ObjCommit, ObjTree, ObjBlob, ObjTag}
-
-// gitPackTypeCode maps an object type to its pack type code.
-func gitPackTypeCode(t ObjectType) (int, bool) {
-	if t < 1 || int(t) > 4 {
-		return 0, false
+	for i := m - 1; i >= 0; i-- {
+		hdr[n] = rev[i]
+		n++
 	}
-	return packCodeByType[t], true
+	hdr[n] = 0
+	n++
+	h := sha1.New()
+	h.Write(hdr[:n])
+	h.Write(raw)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-// gitPackTypeFromCode maps a pack type code back to an object type.
-func gitPackTypeFromCode(code int) (ObjectType, bool) {
-	if code < 1 || code > 4 {
-		return 0, false
-	}
-	return packTypeByCode[code], true
-}
+// Pooled zlib readers and writers. A reader is reset onto a fresh bufio
+// reader per entry; a writer is reset onto the pack buffer per object.
+// Readers go back to the pool only after a clean read to EOF, so a pooled
+// reader is never handed out mid-stream.
+var zlibReaderPool sync.Pool
+var zlibWriterPool sync.Pool
 
-// gitPackAppendHeader appends a pack entry header: the type in bits 4-6 of
-// the first byte, the low 4 bits of the size in bits 0-3, then the remaining
-// size in 7-bit little-endian groups with the continuation bit set on all
-// but the last byte.
-func gitPackAppendHeader(dst []byte, typeCode, size int) []byte {
-	first := byte(typeCode<<4) | byte(size&0x0f)
-	size >>= 4
-	for size > 0 {
-		dst = append(dst, first|0x80)
-		first = byte(size & 0x7f)
-		size >>= 7
-	}
-	return append(dst, first)
-}
-
-// Pooled zlib writers: a compressor's tables are expensive to build, so
-// BuildPack reuses one writer per pack and resets it per object instead of
-// allocating a fresh writer for every entry.
-var pooledZlibWriters = sync.Pool{
-	New: func() any { return zlib.NewWriter(io.Discard) },
-}
-
-// BuildPack assembles a version-2 packfile holding the given objects, in the
-// given order, as whole objects (no deltas). The output is deterministic for
-// identical inputs: same order, same compression level, trailer SHA-1 over
-// all preceding bytes, computed once.
-func BuildPack(objects []*GitObject) ([]byte, error) {
-	var buf bytes.Buffer
-	buf.Grow(12 + len(objects)*64)
-	var head [12]byte
-	copy(head[0:4], "PACK")
-	binary.BigEndian.PutUint32(head[4:8], 2)
-	binary.BigEndian.PutUint32(head[8:12], uint32(len(objects)))
-	buf.Write(head[:])
-	zw := pooledZlibWriters.Get().(*zlib.Writer)
-	defer pooledZlibWriters.Put(zw)
-	for _, obj := range objects {
-		if obj == nil {
-			return nil, errors.New("pack: nil object")
-		}
-		code, ok := gitPackTypeCode(obj.Type)
-		if !ok {
-			return nil, fmt.Errorf("pack: unknown object type %v", obj.Type)
-		}
-		var hb [10]byte
-		buf.Write(gitPackAppendHeader(hb[:0], code, len(obj.Raw)))
-		zw.Reset(&buf)
-		if _, err := zw.Write(obj.Raw); err != nil {
-			return nil, err
-		}
-		if err := zw.Close(); err != nil {
-			return nil, err
-		}
-	}
-	sum := sha1.Sum(buf.Bytes())
-	buf.Write(sum[:])
-	return buf.Bytes(), nil
-}
-
-// PackCacheKey identifies one built pack: the repo generation it was built
-// at, the sorted want and have ids, and the deepen depth (0 when no deepen
-// was requested). Two fetches with the same key hold the same objects, so
-// they pack to identical bytes.
-type PackCacheKey struct {
-	Generation uint64
-	Wants      string // "\n"-joined sorted want ids
-	Haves      string // "\n"-joined sorted have ids
-	Depth      int    // 0 when no deepen was requested
-}
-
-// PackCacheKeyFor builds a PackCacheKey from a generation and raw want/have
-// lists; the lists are sorted and deduplicated, so argument order does not
-// matter.
-func PackCacheKeyFor(generation uint64, wants, haves []string, depth int) PackCacheKey {
-	return PackCacheKey{
-		Generation: generation,
-		Wants:      joinSortedIDs(wants),
-		Haves:      joinSortedIDs(haves),
-		Depth:      depth,
-	}
-}
-
-// joinSortedIDs sorts and deduplicates ids, then joins them with "\n".
-// An empty list joins to "".
-func joinSortedIDs(ids []string) string {
-	if len(ids) == 0 {
-		return ""
-	}
-	sorted := append([]string(nil), ids...)
-	sort.Strings(sorted)
-	out := sorted[:1]
-	for _, id := range sorted[1:] {
-		if id != out[len(out)-1] {
-			out = append(out, id)
-		}
-	}
-	return strings.Join(out, "\n")
-}
-
-// packCacheEntry is one cached pack build; done closes when the build
-// finishes, so concurrent waiters share a single in-flight build.
-type packCacheEntry struct {
-	done chan struct{}
-	pack []byte
-	err  error
-}
-
-// PackCache memoizes built pack bytes. Entries are keyed by generation, so
-// a repo change invalidates them implicitly: a fetch at a new generation
-// can never match an entry built at an old one. DropGeneration removes
-// stale entries to bound memory; correctness never depends on it.
-type PackCache struct {
-	mu      sync.Mutex
-	entries map[PackCacheKey]*packCacheEntry
-}
-
-// NewPackCache creates an empty pack cache.
-func NewPackCache() *PackCache {
-	return &PackCache{entries: make(map[PackCacheKey]*packCacheEntry)}
-}
-
-// packCacheMaxEntries caps the cache; past it the map is reset rather than
-// grown without bound (packs are rebuilt deterministically, so dropping
-// entries only costs a rebuild).
-const packCacheMaxEntries = 512
-
-// Get returns cached pack bytes for key, if a build for it has finished
-// successfully. It never blocks on an in-flight build.
-func (c *PackCache) Get(key PackCacheKey) ([]byte, bool) {
-	c.mu.Lock()
-	e, ok := c.entries[key]
-	c.mu.Unlock()
-	if !ok {
-		return nil, false
-	}
-	select {
-	case <-e.done:
-		if e.err != nil {
-			return nil, false
-		}
-		return e.pack, true
-	default:
-		return nil, false
-	}
-}
-
-// pruneLocked drops finished entries when the cache is at capacity, so a
-// burst of generations never evicts a build still in flight. Only when
-// every entry is still building does it reset the map; a dropped in-flight
-// entry is benign (its waiters already hold it, and the key rebuilds
-// deterministically). Callers hold c.mu.
-func (c *PackCache) pruneLocked() {
-	if len(c.entries) < packCacheMaxEntries {
-		return
-	}
-	for k, e := range c.entries {
-		select {
-		case <-e.done:
-			delete(c.entries, k)
-		default:
-		}
-	}
-	if len(c.entries) >= packCacheMaxEntries {
-		c.entries = make(map[PackCacheKey]*packCacheEntry, packCacheMaxEntries)
-	}
-}
-
-// Clear drops every cached pack.
-func (c *PackCache) Clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.entries = make(map[PackCacheKey]*packCacheEntry, packCacheMaxEntries)
-}
-
-// Put stores finished pack bytes under key.
-func (c *PackCache) Put(key PackCacheKey, pack []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.pruneLocked()
-	e := &packCacheEntry{done: make(chan struct{}), pack: pack}
-	close(e.done)
-	c.entries[key] = e
-}
-
-// GetOrBuild returns the cached pack for key, or builds it once with build
-// and caches the result. Concurrent callers for the same key share the one
-// build: the first builds while the rest wait. A failed build is not
-// cached, so a later call retries.
-func (c *PackCache) GetOrBuild(key PackCacheKey, build func() ([]byte, error)) ([]byte, error) {
-	c.mu.Lock()
-	if e, ok := c.entries[key]; ok {
-		c.mu.Unlock()
-		<-e.done
-		return e.pack, e.err
-	}
-	c.pruneLocked()
-	e := &packCacheEntry{done: make(chan struct{})}
-	c.entries[key] = e
-	c.mu.Unlock()
-	pack, err := build()
-	e.pack, e.err = pack, err
-	close(e.done)
-	if err != nil {
-		c.mu.Lock()
-		if cur, ok := c.entries[key]; ok && cur == e {
-			delete(c.entries, key)
-		}
-		c.mu.Unlock()
-	}
-	return pack, err
-}
-
-// DropGeneration removes every entry built at generation gen (stale after
-// the repo moved on). Entries for other generations are untouched.
-func (c *PackCache) DropGeneration(gen uint64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for k := range c.entries {
-		if k.Generation == gen {
-			delete(c.entries, k)
-		}
-	}
-}
-
-// PackBaseResolver supplies a base object held outside the pack (a thin
-// pack's REF_DELTA base). It reports false when the object is not held.
-type PackBaseResolver func(oid string) (ObjectType, []byte, bool)
-
-// ParsePack decodes a packfile into objects, resolving every delta whose
-// base is in the pack. It verifies the trailer checksum and rejects corrupt
-// packs.
-func ParsePack(data []byte) ([]*PackObject, error) {
-	return gitParsePack(data, nil)
-}
-
-// ParsePackWithResolver decodes a packfile like ParsePack, consulting
-// resolve for REF_DELTA bases that are not in the pack.
-func ParsePackWithResolver(data []byte, resolve PackBaseResolver) ([]*PackObject, error) {
-	return gitParsePack(data, resolve)
-}
-
-// Pooled zlib readers: a decompressor's tables are expensive to build, so
-// entry inflation reuses readers from the pool and resets them onto each
-// entry's byte stream instead of allocating a fresh reader per entry.
-var pooledZlibReaders sync.Pool // holds io.ReadCloser
-
-// zlibResetter is the Reset method every zlib reader carries.
-type zlibResetter interface {
+// pooledZlibReader is the interface a pooled zlib reader must satisfy:
+// the ReadCloser returned by zlib.NewReader plus the Reset method its
+// concrete type carries (the type itself is unexported in compress/zlib).
+type pooledZlibReader interface {
+	io.ReadCloser
 	Reset(io.Reader, []byte) error
 }
 
-// acquireZlibReader returns a reader over br, reusing a pooled one when
-// possible and allocating a fresh one otherwise.
-func acquireZlibReader(br *bytes.Reader) (io.ReadCloser, error) {
-	if v := pooledZlibReaders.Get(); v != nil {
-		zr := v.(io.ReadCloser)
-		if rz, ok := zr.(zlibResetter); ok {
-			if err := rz.Reset(br, nil); err == nil {
-				return zr, nil
-			}
+func acquireZlibReader(r io.Reader) (pooledZlibReader, error) {
+	if v := zlibReaderPool.Get(); v != nil {
+		zr := v.(pooledZlibReader)
+		if err := zr.Reset(r, nil); err != nil {
+			return nil, err
 		}
+		return zr, nil
 	}
-	return zlib.NewReader(br)
+	rc, err := zlib.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	zr, ok := rc.(pooledZlibReader)
+	if !ok {
+		rc.Close()
+		return nil, errors.New("pack: zlib reader cannot be reset")
+	}
+	return zr, nil
 }
 
-// releaseZlibReader returns a reader to the pool for reuse by a later
-// entry. No Close is needed: Reset on the next acquisition discards the
-// old stream state, and the reader holds no OS resource.
-func releaseZlibReader(zr io.ReadCloser) {
-	pooledZlibReaders.Put(zr)
+func releaseZlibReader(zr pooledZlibReader) { zlibReaderPool.Put(zr) }
+
+func acquireZlibWriter(w io.Writer) *zlib.Writer {
+	if v := zlibWriterPool.Get(); v != nil {
+		zw := v.(*zlib.Writer)
+		zw.Reset(w)
+		return zw
+	}
+	return zlib.NewWriter(w)
 }
 
-// gitPackEntry is one raw pack entry before delta resolution.
-type gitPackEntry struct {
+func releaseZlibWriter(zw *zlib.Writer) { zlibWriterPool.Put(zw) }
+
+// appendPackObjectHeader appends the type/size varint that starts one pack
+// entry: the low 4 bits of the size ride in the first byte next to the
+// type, later bytes carry 7 size bits each, high bit set while more follow.
+func appendPackObjectHeader(dst []byte, code, size int) []byte {
+	first := byte(code<<4) | byte(size&0x0f)
+	size >>= 4
+	if size == 0 {
+		return append(dst, first)
+	}
+	dst = append(dst, first|0x80)
+	for {
+		b := byte(size & 0x7f)
+		size >>= 7
+		if size == 0 {
+			return append(dst, b)
+		}
+		dst = append(dst, b|0x80)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pack reading
+// ---------------------------------------------------------------------------
+
+// packEntryParsed is one entry as read from the pack, before delta
+// resolution. typ/raw/oid are filled in by resolvePackEntries.
+type packEntryParsed struct {
 	offset     int
-	typeCode   int
+	code       int
 	size       int
 	data       []byte // inflated bytes: object bytes, or delta instructions
-	baseOffset int    // ofs-delta only, -1 otherwise
+	baseOffset int    // ofs-delta only: absolute pack offset of the base
 	baseOID    string // ref-delta only
-	resolved   bool
-	resType    ObjectType
-	resRaw     []byte
-	resSHA     string
+	typ        string
+	raw        []byte
+	oid        string
+	done       bool
 }
 
-func gitParsePack(data []byte, resolve PackBaseResolver) ([]*PackObject, error) {
+// ParsePack reads a whole packfile: whole objects plus ofs-delta and
+// ref-delta entries (deltas applied recursively). The trailer SHA-1 is
+// verified before any entry is trusted. Returned objects are in pack order
+// with OIDs computed by ObjectSHA. A ref-delta whose base is not in the
+// pack is an error: there is no outside object lookup in this signature.
+func ParsePack(data []byte) ([]RawObject, error) {
 	if len(data) < 32 {
-		return nil, errors.New("pack: too short")
+		return nil, errors.New("pack: too short for header and trailer")
 	}
-	trailerStart := len(data) - 20
-	sum := sha1.Sum(data[:trailerStart])
-	if !bytes.Equal(sum[:], data[trailerStart:]) {
-		return nil, errors.New("pack: trailer checksum mismatch")
-	}
-	if string(data[0:4]) != "PACK" {
+	if string(data[:4]) != "PACK" {
 		return nil, errors.New("pack: bad magic")
 	}
 	version := binary.BigEndian.Uint32(data[4:8])
 	if version != 2 && version != 3 {
 		return nil, fmt.Errorf("pack: unsupported version %d", version)
 	}
-	count := binary.BigEndian.Uint32(data[8:12])
-	if count > 1<<24 {
-		return nil, errors.New("pack: object count implausible")
+	count := int(binary.BigEndian.Uint32(data[8:12]))
+	trailerStart := len(data) - 20
+	want := sha1.Sum(data[:trailerStart])
+	if !bytes.Equal(want[:], data[trailerStart:]) {
+		return nil, errors.New("pack: trailer checksum mismatch")
 	}
-	capHint := count
-	if capHint > 4096 {
-		capHint = 4096
+	entries, err := readPackEntries(data, count, trailerStart)
+	if err != nil {
+		return nil, err
 	}
-	entries := make([]*gitPackEntry, 0, capHint)
-	byOffset := make(map[int]*gitPackEntry, capHint)
-	offset := 12
-	for i := uint32(0); i < count; i++ {
-		entryOffset := offset
-		if offset >= trailerStart {
-			return nil, errors.New("pack: truncated entry header")
-		}
-		b := data[offset]
-		offset++
-		typeCode := int(b>>4) & 0x07
-		size := int(b & 0x0f)
-		shift := uint(4)
-		for b&0x80 != 0 {
-			if offset >= trailerStart {
-				return nil, errors.New("pack: truncated size varint")
-			}
-			b = data[offset]
-			offset++
-			size |= int(b&0x7f) << shift
-			shift += 7
-			if shift > 63 {
-				return nil, errors.New("pack: size varint too long")
-			}
-		}
-		if size < 0 || size > gitPackMaxObjectSize {
-			return nil, errors.New("pack: object size out of range")
-		}
-		entry := &gitPackEntry{offset: entryOffset, typeCode: typeCode, size: size, baseOffset: -1}
-		switch typeCode {
-		case 1, 2, 3, 4:
-		case 6: // ofs-delta: base offset encoded as a backwards varint
-			if offset >= trailerStart {
-				return nil, errors.New("pack: truncated ofs-delta base")
-			}
-			b = data[offset]
-			offset++
-			value := int64(b & 0x7f)
-			for b&0x80 != 0 {
-				if offset >= trailerStart {
-					return nil, errors.New("pack: truncated ofs-delta base")
-				}
-				b = data[offset]
-				offset++
-				value = ((value + 1) << 7) | int64(b&0x7f)
-				if value > int64(entryOffset) {
-					return nil, errors.New("pack: ofs-delta base before pack start")
-				}
-			}
-			if value <= 0 {
-				return nil, errors.New("pack: ofs-delta base offset is zero")
-			}
-			entry.baseOffset = entryOffset - int(value)
-		case 7: // ref-delta: 20-byte base object id
-			if offset+20 > trailerStart {
-				return nil, errors.New("pack: truncated ref-delta base")
-			}
-			entry.baseOID = hex.EncodeToString(data[offset : offset+20])
-			offset += 20
-		default:
-			return nil, fmt.Errorf("pack: unknown entry type code %d", typeCode)
-		}
-		// Inflate exactly one zlib stream into a buffer sized to the
-		// declared size. bytes.Reader is an io.ByteReader, so the pooled
-		// reader consumes exactly the stream's bytes and the reader's
-		// remaining length gives the next entry's offset.
-		br := bytes.NewReader(data[offset:trailerStart])
-		zr, err := acquireZlibReader(br)
-		if err != nil {
-			return nil, fmt.Errorf("pack: zlib stream at %d: %w", offset, err)
-		}
-		inflated := make([]byte, size)
-		got, rerr := io.ReadFull(zr, inflated)
-		if rerr != nil {
-			releaseZlibReader(zr)
-			if got < size {
-				return nil, fmt.Errorf("pack: entry at %d declares %d bytes, inflated %d", entryOffset, size, got)
-			}
-			return nil, fmt.Errorf("pack: inflate at %d: %w", offset, rerr)
-		}
-		var extra [1]byte
-		if m, _ := zr.Read(extra[:]); m > 0 {
-			releaseZlibReader(zr)
-			return nil, fmt.Errorf("pack: entry at %d declares %d bytes, inflated more", entryOffset, size)
-		}
-		releaseZlibReader(zr)
-		offset += (trailerStart - offset) - br.Len()
-		entry.data = inflated
-		entries = append(entries, entry)
-		byOffset[entryOffset] = entry
+	if _, err := resolvePackEntries(entries); err != nil {
+		return nil, err
 	}
-	if offset != trailerStart {
-		return nil, errors.New("pack: trailing bytes before trailer")
-	}
-
-	// Resolve: whole objects first, then deltas in passes until every entry
-	// resolves or a full pass makes no progress (missing base or cycle).
-	// Bases may appear after their deltas in the pack, so resolution cannot
-	// assume pack order.
-	resolvedByOID := make(map[string]*gitPackEntry, len(entries))
-	remaining := 0
+	out := make([]RawObject, 0, len(entries))
 	for _, e := range entries {
-		if e.typeCode >= 1 && e.typeCode <= 4 {
-			t, _ := gitPackTypeFromCode(e.typeCode)
-			e.resType = t
-			e.resRaw = e.data
-			e.resSHA = ObjectSHA(t, e.data)
-			e.resolved = true
-			resolvedByOID[e.resSHA] = e
-		} else {
-			remaining++
-		}
-	}
-	for remaining > 0 {
-		progress := false
-		for _, e := range entries {
-			if e.resolved {
-				continue
-			}
-			var baseType ObjectType
-			var baseRaw []byte
-			ok := false
-			if e.typeCode == 6 {
-				base := byOffset[e.baseOffset]
-				if base == nil {
-					return nil, fmt.Errorf("pack: ofs-delta at %d names unknown base offset %d", e.offset, e.baseOffset)
-				}
-				if !base.resolved {
-					continue
-				}
-				baseType, baseRaw, ok = base.resType, base.resRaw, true
-			} else {
-				if base, found := resolvedByOID[e.baseOID]; found && base.resolved {
-					baseType, baseRaw, ok = base.resType, base.resRaw, true
-				} else if resolve != nil {
-					if t, raw, found := resolve(e.baseOID); found {
-						baseType, baseRaw, ok = t, raw, true
-					}
-				}
-				if !ok {
-					continue
-				}
-			}
-			raw, err := gitApplyDelta(baseRaw, e.data)
-			if err != nil {
-				return nil, fmt.Errorf("pack: delta at %d: %w", e.offset, err)
-			}
-			e.resType = baseType
-			e.resRaw = raw
-			e.resSHA = ObjectSHA(baseType, raw)
-			e.resolved = true
-			resolvedByOID[e.resSHA] = e
-			remaining--
-			progress = true
-		}
-		if !progress {
-			return nil, errors.New("pack: delta base missing or delta cycle")
-		}
-	}
-	out := make([]*PackObject, len(entries))
-	for i, e := range entries {
-		out[i] = &PackObject{Type: e.resType, Raw: e.resRaw, SHA: e.resSHA}
+		out = append(out, RawObject{Type: e.typ, Raw: e.raw, OID: e.oid})
 	}
 	return out, nil
 }
 
-// gitApplyDelta applies a git delta instruction stream to a base object's
-// bytes: two size varints (source, target), then copy/insert opcodes. Copy
-// opcodes (high bit set) name offset/size bytes with bits 0-2/4-6; a zero
-// copy size means 0x10000; insert opcodes (high bit clear, non-zero) carry
-// that many literal bytes; opcode 0 is invalid.
-func gitApplyDelta(base, delta []byte) ([]byte, error) {
-	off := 0
+// readPackEntries walks the entry table between the header and the trailer,
+// inflating each entry's zlib stream. It returns an error on any truncation,
+// unknown type code, size mismatch or stray byte before the trailer.
+func readPackEntries(data []byte, count, trailerStart int) ([]*packEntryParsed, error) {
+	entries := make([]*packEntryParsed, 0, count)
+	offset := 12
+	for i := 0; i < count; i++ {
+		if offset >= trailerStart {
+			return nil, errors.New("pack: truncated entry table")
+		}
+		start := offset
+		code, size, next, err := readPackEntryHeader(data, offset, trailerStart)
+		if err != nil {
+			return nil, err
+		}
+		offset = next
+		e := &packEntryParsed{offset: start, code: code, size: size}
+		switch code {
+		case packOfsDelta:
+			back, n2, err := readOfsDeltaBase(data, offset, trailerStart)
+			if err != nil {
+				return nil, err
+			}
+			offset = n2
+			if back <= 0 || back > start {
+				return nil, fmt.Errorf("pack: ofs-delta at %d has bad base distance %d", start, back)
+			}
+			e.baseOffset = start - back
+		case packRefDelta:
+			if offset+20 > trailerStart {
+				return nil, errors.New("pack: truncated ref-delta base id")
+			}
+			e.baseOID = hex.EncodeToString(data[offset : offset+20])
+			offset += 20
+		default:
+			if _, ok := packCodeTypes[code]; !ok {
+				return nil, fmt.Errorf("pack: unknown entry type %d at %d", code, start)
+			}
+		}
+		raw, used, err := inflatePackEntry(data, offset, trailerStart, size)
+		if err != nil {
+			return nil, err
+		}
+		e.data = raw
+		offset += used
+		entries = append(entries, e)
+	}
+	if offset != trailerStart {
+		return nil, fmt.Errorf("pack: %d stray bytes before trailer", trailerStart-offset)
+	}
+	return entries, nil
+}
+
+// readPackEntryHeader decodes the type/size varint at offset. limit bounds
+// the read so a truncated header is an error, not a slice overrun.
+func readPackEntryHeader(data []byte, offset, limit int) (code, size, next int, err error) {
+	if offset >= limit {
+		return 0, 0, 0, errors.New("pack: truncated entry header")
+	}
+	b := data[offset]
+	offset++
+	code = int(b>>4) & 0x07
+	size = int(b & 0x0f)
+	shift := uint(4)
+	for b&0x80 != 0 {
+		if offset >= limit {
+			return 0, 0, 0, errors.New("pack: truncated entry size")
+		}
+		b = data[offset]
+		offset++
+		size |= int(b&0x7f) << shift
+		shift += 7
+		if shift > 63 {
+			return 0, 0, 0, errors.New("pack: entry size too long")
+		}
+	}
+	return code, size, offset, nil
+}
+
+// readOfsDeltaBase decodes the ofs-delta base distance: each byte adds its
+// low 7 bits, with the running value bumped by one before every shift, so
+// the distance is the entry offset minus the decoded value.
+func readOfsDeltaBase(data []byte, offset, limit int) (back, next int, err error) {
+	if offset >= limit {
+		return 0, 0, errors.New("pack: truncated ofs-delta base")
+	}
+	b := data[offset]
+	offset++
+	back = int(b & 0x7f)
+	for b&0x80 != 0 {
+		if offset >= limit {
+			return 0, 0, errors.New("pack: truncated ofs-delta base")
+		}
+		b = data[offset]
+		offset++
+		back = ((back + 1) << 7) | int(b&0x7f)
+	}
+	return back, offset, nil
+}
+
+// inflatePackEntry inflates one zlib stream starting at offset and reports
+// how many pack bytes the stream consumed, so the caller can find the next
+// entry. The stream is read through a bufio reader: bytes the flate reader
+// has not pulled out of it are still buffered, so consumed is exact.
+// The inflated length must equal the size declared in the entry header.
+func inflatePackEntry(data []byte, offset, limit, want int) ([]byte, int, error) {
+	src := bytes.NewReader(data[offset:limit])
+	br := bufio.NewReader(src)
+	zr, err := acquireZlibReader(br)
+	if err != nil {
+		return nil, 0, fmt.Errorf("pack: zlib open at %d: %w", offset, err)
+	}
+	out, err := io.ReadAll(zr)
+	if err != nil {
+		return nil, 0, fmt.Errorf("pack: zlib inflate at %d: %w", offset, err)
+	}
+	releaseZlibReader(zr)
+	if len(out) != want {
+		return nil, 0, fmt.Errorf("pack: entry at %d declares %d bytes, inflated %d", offset, want, len(out))
+	}
+	// Bytes the stream consumed are the slice length minus everything
+	// still unread: what is left in the underlying reader plus what is
+	// still buffered in front of it. (Buffered alone is not enough: the
+	// bufio reader only pulls 4 KiB at a time, so for a pack larger than
+	// that the rest is still sitting in the underlying reader.)
+	used := (limit - offset) - src.Len() - br.Buffered()
+	if used <= 0 {
+		return nil, 0, fmt.Errorf("pack: zlib stream at %d consumed no bytes", offset)
+	}
+	return out, used, nil
+}
+
+// resolvePackEntries turns every parsed entry into its final object:
+// whole objects take their type directly, deltas are applied onto their
+// resolved base. Resolution is recursive with a cycle guard, so a delta
+// may point at a base anywhere in the pack. The offset and oid lookup maps
+// are built only when the pack actually contains that delta kind, keeping
+// the common whole-objects-only push free of map allocations.
+func resolvePackEntries(entries []*packEntryParsed) ([]*packEntryParsed, error) {
+	needOffset := false
+	needOID := false
+	for _, e := range entries {
+		if e.code == packOfsDelta {
+			needOffset = true
+		}
+		if e.code == packRefDelta {
+			needOID = true
+		}
+	}
+	var byOffset map[int]*packEntryParsed
+	if needOffset {
+		byOffset = make(map[int]*packEntryParsed, len(entries))
+		for _, e := range entries {
+			byOffset[e.offset] = e
+		}
+	}
+	var byOID map[string]*packEntryParsed
+	if needOID {
+		byOID = make(map[string]*packEntryParsed, len(entries))
+	}
+	resolving := make(map[int]bool, len(entries))
+	var resolve func(e *packEntryParsed) error
+	resolve = func(e *packEntryParsed) error {
+		if e.done {
+			return nil
+		}
+		if resolving[e.offset] {
+			return fmt.Errorf("pack: delta cycle at offset %d", e.offset)
+		}
+		resolving[e.offset] = true
+		defer delete(resolving, e.offset)
+		switch e.code {
+		case packOfsDelta:
+			base := byOffset[e.baseOffset]
+			if base == nil {
+				return fmt.Errorf("pack: ofs-delta base at offset %d missing", e.baseOffset)
+			}
+			if err := resolve(base); err != nil {
+				return err
+			}
+			raw, err := applyGitDelta(base.raw, e.data)
+			if err != nil {
+				return err
+			}
+			e.typ = base.typ
+			e.raw = raw
+		case packRefDelta:
+			base := byOID[e.baseOID]
+			if base == nil {
+				for _, cand := range entries {
+					if cand == e {
+						continue
+					}
+					if err := resolve(cand); err != nil {
+						return err
+					}
+					if cand.oid == e.baseOID {
+						base = cand
+						break
+					}
+				}
+			}
+			if base == nil {
+				return fmt.Errorf("pack: ref-delta base %s not in pack", e.baseOID)
+			}
+			raw, err := applyGitDelta(base.raw, e.data)
+			if err != nil {
+				return err
+			}
+			e.typ = base.typ
+			e.raw = raw
+		default:
+			e.typ = packCodeTypes[e.code]
+			e.raw = e.data
+		}
+		e.oid = ObjectSHA(e.typ, e.raw)
+		e.done = true
+		if needOID {
+			byOID[e.oid] = e
+		}
+		return nil
+	}
+	for _, e := range entries {
+		if err := resolve(e); err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
+}
+
+// applyGitDelta applies a git delta instruction stream to a base object.
+// The stream starts with the base size and result size as varints (7 bits
+// per byte, low group first), then copy/insert ops: a high-bit op copies a
+// slice of the base (offset bits 0-3, size bits 4-6, size 0 means 65536),
+// any other nonzero op inserts that many literal bytes. Opcode 0 and any
+// out-of-range copy or over-long result are errors.
+func applyGitDelta(base, delta []byte) ([]byte, error) {
+	pos := 0
 	readSize := func() (int, error) {
-		value := 0
+		v := 0
 		shift := uint(0)
 		for {
-			if off >= len(delta) {
-				return 0, errors.New("delta: truncated size")
+			if pos >= len(delta) {
+				return 0, errors.New("pack: truncated delta size")
 			}
-			b := delta[off]
-			off++
-			value |= int(b&0x7f) << shift
+			b := delta[pos]
+			pos++
+			v |= int(b&0x7f) << shift
 			shift += 7
 			if b&0x80 == 0 {
 				break
 			}
 			if shift > 63 {
-				return 0, errors.New("delta: size varint too long")
+				return 0, errors.New("pack: delta size too long")
 			}
 		}
-		return value, nil
+		return v, nil
 	}
 	srcSize, err := readSize()
 	if err != nil {
@@ -669,66 +470,303 @@ func gitApplyDelta(base, delta []byte) ([]byte, error) {
 		return nil, err
 	}
 	if srcSize != len(base) {
-		return nil, fmt.Errorf("delta: base size %d, expected %d", len(base), srcSize)
+		return nil, fmt.Errorf("pack: delta expects %d-byte base, got %d", srcSize, len(base))
 	}
-	if tgtSize < 0 || tgtSize > gitPackMaxObjectSize {
-		return nil, errors.New("delta: target size out of range")
+	if tgtSize > 1<<28 {
+		return nil, fmt.Errorf("pack: delta target size %d too large", tgtSize)
 	}
 	out := make([]byte, 0, tgtSize)
-	for off < len(delta) {
-		op := delta[off]
-		off++
+	for pos < len(delta) {
+		op := delta[pos]
+		pos++
 		if op&0x80 != 0 {
-			copyOff := 0
-			copySize := 0
-			shift := uint(0)
-			for bit := uint(0); bit < 4; bit++ {
+			var copyOff, copySize int
+			for bit := 0; bit < 4; bit++ {
 				if op&(1<<bit) != 0 {
-					if off >= len(delta) {
-						return nil, errors.New("delta: truncated copy offset")
+					if pos >= len(delta) {
+						return nil, errors.New("pack: truncated delta copy offset")
 					}
-					copyOff |= int(delta[off]) << shift
-					off++
+					copyOff |= int(delta[pos]) << (8 * bit)
+					pos++
 				}
-				shift += 8
 			}
-			shift = 0
-			for bit := uint(4); bit < 7; bit++ {
-				if op&(1<<bit) != 0 {
-					if off >= len(delta) {
-						return nil, errors.New("delta: truncated copy size")
+			for bit := 0; bit < 3; bit++ {
+				if op&(0x10<<bit) != 0 {
+					if pos >= len(delta) {
+						return nil, errors.New("pack: truncated delta copy size")
 					}
-					copySize |= int(delta[off]) << shift
-					off++
+					copySize |= int(delta[pos]) << (8 * bit)
+					pos++
 				}
-				shift += 8
 			}
 			if copySize == 0 {
 				copySize = 0x10000
 			}
-			if copyOff < 0 || copySize < 0 || copyOff+copySize > len(base) {
-				return nil, errors.New("delta: copy out of range")
+			if copyOff+copySize > len(base) {
+				return nil, errors.New("pack: delta copy outside base")
 			}
 			if len(out)+copySize > tgtSize {
-				return nil, errors.New("delta: output exceeds target size")
+				return nil, errors.New("pack: delta writes past target size")
 			}
 			out = append(out, base[copyOff:copyOff+copySize]...)
 		} else if op != 0 {
-			n := int(op & 0x7f)
-			if off+n > len(delta) {
-				return nil, errors.New("delta: truncated insert")
+			n := int(op)
+			if pos+n > len(delta) {
+				return nil, errors.New("pack: truncated delta insert")
 			}
 			if len(out)+n > tgtSize {
-				return nil, errors.New("delta: output exceeds target size")
+				return nil, errors.New("pack: delta writes past target size")
 			}
-			out = append(out, delta[off:off+n]...)
-			off += n
+			out = append(out, delta[pos:pos+n]...)
+			pos += n
 		} else {
-			return nil, errors.New("delta: opcode 0")
+			return nil, errors.New("pack: delta opcode 0 is invalid")
 		}
 	}
 	if len(out) != tgtSize {
-		return nil, fmt.Errorf("delta: produced %d bytes, expected %d", len(out), tgtSize)
+		return nil, fmt.Errorf("pack: delta produced %d of %d bytes", len(out), tgtSize)
 	}
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Pack writing
+// ---------------------------------------------------------------------------
+
+// BuildPack writes a version 2 pack of whole objects only, for the oids
+// given, in ascending oid order (adjacent duplicates dropped). The trailer
+// is the SHA-1 of everything before it. This is the cold path: callers
+// serve cached bytes and only build once per pack-cache key.
+func BuildPack(snap *RepoSnapshot, oids []string) ([]byte, error) {
+	if snap == nil {
+		return nil, errors.New("pack: nil snapshot")
+	}
+	sorted := append([]string(nil), oids...)
+	sort.Strings(sorted)
+	uniq := sorted[:0]
+	for i, oid := range sorted {
+		if i == 0 || oid != sorted[i-1] {
+			uniq = append(uniq, oid)
+		}
+	}
+	sorted = uniq
+	var out bytes.Buffer
+	out.Grow(64 + len(sorted)*64)
+	var head [12]byte
+	copy(head[0:4], "PACK")
+	binary.BigEndian.PutUint32(head[4:8], 2)
+	binary.BigEndian.PutUint32(head[8:12], uint32(len(sorted)))
+	out.Write(head[:])
+	for _, oid := range sorted {
+		obj, ok := snap.Objects[oid]
+		if !ok || obj == nil {
+			return nil, fmt.Errorf("pack: object %s not in snapshot", oid)
+		}
+		code, ok := packTypeCodes[obj.Type]
+		if !ok {
+			return nil, fmt.Errorf("pack: unknown object type %q", obj.Type)
+		}
+		out.Write(appendPackObjectHeader(nil, code, len(obj.Raw)))
+		zw := acquireZlibWriter(&out)
+		if _, err := zw.Write(obj.Raw); err != nil {
+			return nil, fmt.Errorf("pack: deflate %s: %w", oid, err)
+		}
+		if err := zw.Close(); err != nil {
+			return nil, fmt.Errorf("pack: deflate close %s: %w", oid, err)
+		}
+		releaseZlibWriter(zw)
+	}
+	sum := sha1.Sum(out.Bytes())
+	out.Write(sum[:])
+	return out.Bytes(), nil
+}
+
+// ---------------------------------------------------------------------------
+// Pack cache (single-flight)
+// ---------------------------------------------------------------------------
+
+// PackCacheKey names one built pack: the repo generation it was built from,
+// the wanted and had object ids, and the fetch depth. Wants and Haves are
+// joined id lists; String sorts each list so the same set spells one key.
+type PackCacheKey struct {
+	Generation uint64
+	Wants      string
+	Haves      string
+	Depth      int
+}
+
+func (k PackCacheKey) String() string {
+	var b strings.Builder
+	b.WriteString("gen=")
+	b.WriteString(strconv.FormatUint(k.Generation, 10))
+	b.WriteString("|wants=")
+	b.WriteString(sortedKeyPart(k.Wants))
+	b.WriteString("|haves=")
+	b.WriteString(sortedKeyPart(k.Haves))
+	b.WriteString("|depth=")
+	b.WriteString(strconv.Itoa(k.Depth))
+	return b.String()
+}
+
+// sortedKeyPart orders the comma/space separated ids in one key part.
+func sortedKeyPart(s string) string {
+	if !strings.ContainsAny(s, ", ") {
+		return s
+	}
+	parts := strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' })
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+type packEntry struct {
+	done chan struct{}
+	data []byte
+	err  error
+}
+
+// PackCache memoizes built packs by key. The first caller for a key runs
+// the build; concurrent callers for the same key wait on its done channel
+// and share the result, so one generation is built once even under a burst
+// of identical fetches. A failed build is not cached: the entry is dropped
+// once its waiters have been told, so the next caller retries.
+type PackCache struct {
+	mu sync.Mutex
+	m  map[string]*packEntry
+}
+
+func NewPackCache() *PackCache {
+	return &PackCache{m: make(map[string]*packEntry)}
+}
+
+func (c *PackCache) GetOrBuild(key PackCacheKey, build func() ([]byte, error)) ([]byte, error) {
+	name := key.String()
+	c.mu.Lock()
+	if e, ok := c.m[name]; ok {
+		c.mu.Unlock()
+		<-e.done
+		return e.data, e.err
+	}
+	e := &packEntry{done: make(chan struct{})}
+	c.m[name] = e
+	c.mu.Unlock()
+	data, err := build()
+	e.data = data
+	e.err = err
+	close(e.done)
+	if err != nil {
+		c.mu.Lock()
+		if c.m[name] == e {
+			delete(c.m, name)
+		}
+		c.mu.Unlock()
+	}
+	return data, err
+}
+
+// ---------------------------------------------------------------------------
+// Pkt-line and sideband framing
+// ---------------------------------------------------------------------------
+
+func hexNibble(v int) byte {
+	if v < 10 {
+		return byte('0' + v)
+	}
+	return byte('a' + v - 10)
+}
+
+// EncodePktLine frames data as one pkt-line: a 4-hex-digit length prefix
+// (payload plus the 4 prefix bytes) followed by the payload. Panics on a
+// payload over the 65520-byte pkt-line maximum; callers that frame large
+// blobs must split first, as EncodeSideband does.
+func EncodePktLine(data []byte) []byte {
+	n := len(data) + 4
+	if n > 65520 {
+		panic("pack: pkt-line payload exceeds 65520 bytes")
+	}
+	out := make([]byte, 0, n)
+	out = append(out, hexNibble(n>>12), hexNibble((n>>8)&0xf), hexNibble((n>>4)&0xf), hexNibble(n&0xf))
+	out = append(out, data...)
+	return out
+}
+
+// EncodeFlush returns the flush packet "0000".
+func EncodeFlush() []byte {
+	return []byte{'0', '0', '0', '0'}
+}
+
+func parsePktLen(b []byte) (int, error) {
+	n := 0
+	for _, c := range b {
+		var v int
+		switch {
+		case c >= '0' && c <= '9':
+			v = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			v = int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v = int(c-'A') + 10
+		default:
+			return 0, errors.New("pack: bad pkt-line length")
+		}
+		n = n*16 + v
+	}
+	return n, nil
+}
+
+// DecodePktLines splits a whole pkt-line stream into payloads. Control
+// packets (flush 0000, delim 0001, response-end 0002) come back as a nil
+// entry each, so a caller can tell where a section ended. Any truncation,
+// bad length digit or over-long packet is an error.
+func DecodePktLines(data []byte) ([][]byte, error) {
+	var out [][]byte
+	for len(data) > 0 {
+		if len(data) < 4 {
+			return nil, errors.New("pack: truncated pkt-line")
+		}
+		n, err := parsePktLen(data[:4])
+		if err != nil {
+			return nil, err
+		}
+		switch n {
+		case 0, 1, 2:
+			out = append(out, nil)
+			data = data[4:]
+		default:
+			if n < 4 || n > 65520 {
+				return nil, fmt.Errorf("pack: bad pkt-line length %d", n)
+			}
+			if len(data) < n {
+				return nil, errors.New("pack: truncated pkt-line")
+			}
+			payload := make([]byte, n-4)
+			copy(payload, data[4:n])
+			out = append(out, payload)
+			data = data[n:]
+		}
+	}
+	return out, nil
+}
+
+// EncodeSideband frames data for sideband-64k: each frame is one pkt-line
+// holding a band byte followed by a slice of the data, split so no frame
+// tops the 65520-byte pkt-line maximum (4 header + 1 band + 65515 data).
+// Empty data frames nothing.
+func EncodeSideband(band byte, data []byte) []byte {
+	const maxData = 65520 - 4 - 1
+	if len(data) == 0 {
+		return nil
+	}
+	var out []byte
+	for len(data) > 0 {
+		take := len(data)
+		if take > maxData {
+			take = maxData
+		}
+		frame := make([]byte, 0, take+1)
+		frame = append(frame, band)
+		frame = append(frame, data[:take]...)
+		out = append(out, EncodePktLine(frame)...)
+		data = data[take:]
+	}
+	return out
 }
